@@ -1,0 +1,22 @@
+# Environment and Secrets
+.env
+.env*
+!.env.example
+
+# Virtual Environment
+pepper_env/
+venv/
+.venv/
+
+# Python Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Project Specific
+*.wav
+*.mp3
+logs/
+.antigravity/

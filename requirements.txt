@@ -1,0 +1,28 @@
+# Pepper Robot AI - Requirements
+
+# Robot Control
+qi>=1.7.0  # Pepper NAOqi framework
+
+# AI/LLM
+groq>=0.4.0  # Groq API for LLM and Whisper
+
+# Text-to-Speech
+edge-tts>=6.1.0  # Microsoft Edge TTS (free, unlimited)
+elevenlabs>=0.2.0  # ElevenLabs TTS (optional, best quality)
+
+# Keyboard Controls
+pynput>=1.7.6  # Keyboard/mouse input handling
+
+# GUI (DearPyGUI - GPU-accelerated, perfect for video streaming)
+dearpygui>=1.10.0  # Modern, fast GUI framework
+
+# Web Search (DuckDuckGo - Free, unlimited)
+duckduckgo-search>=4.0.0  # Free web search API
+
+# Voice / STT (Push-to-Talk + Groq Whisper)
+sounddevice>=0.4.6        # Cross-platform audio recording
+soundfile>=0.12.0          # WAV file I/O
+numpy>=1.24.0              # Audio array manipulation
+
+# Environment Variables
+python-dotenv>=1.0.0      # Auto-load .env files
