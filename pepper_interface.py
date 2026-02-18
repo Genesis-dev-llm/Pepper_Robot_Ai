@@ -6,6 +6,7 @@ Handles all communication and control with Pepper via qi library
 import qi
 import time
 import threading
+import random
 from typing import Optional
 
 class PepperRobot:
@@ -21,6 +22,7 @@ class PepperRobot:
         self.leds = None
         self.awareness = None
         self._speech_lock = threading.Lock()   # Prevent overlapping speech
+        self._is_speaking_hq = False           # Flag for HQ audio animation loop
         
     def connect(self) -> bool:
         """Establish connection to Pepper"""
@@ -88,23 +90,59 @@ class PepperRobot:
     def play_audio_file(self, file_path: str) -> bool:
         """
         Play a local audio file through Pepper's speakers via ALAudioPlayer.
-
-        Args:
-            file_path: Absolute path to a WAV or MP3 file accessible on the robot
-                       (or on the machine running this script if using a local qi session).
-
-        Returns:
-            True if playback succeeded, False otherwise.
+        Includes a background thread to handle animations (gestures/LEDs)
+        so Pepper doesn't look like a statue while speaking external audio.
         """
         with self._speech_lock:
             try:
                 player = self.session.service("ALAudioPlayer")
                 file_id = player.loadFile(file_path)
+                
+                # Start background animation loop
+                self._is_speaking_hq = True
+                anim_thread = threading.Thread(
+                    target=self._hq_speech_animation_loop,
+                    daemon=True,
+                    name="HQSpeechAnimation"
+                )
+                anim_thread.start()
+                
+                # Play audio (this blocks until done)
                 player.play(file_id)
+                
+                # Stop animation loop
+                self._is_speaking_hq = False
                 return True
             except Exception as e:
+                self._is_speaking_hq = False
                 print(f"⚠️ ALAudioPlayer failed ({e}), falling back to built-in TTS")
                 return False
+
+    def _hq_speech_animation_loop(self):
+        """Internal loop to trigger gestures while HQ audio is playing."""
+        gestures = [self.nod, self.explaining_gesture, self.thinking_gesture, self.look_around]
+        
+        while self._is_speaking_hq:
+            try:
+                # 1. Pulse eyes
+                self.set_eye_color("blue")
+                
+                # 2. Pick a random gesture occasionally
+                if random.random() > 0.6:  # 40% chance every 2-3 seconds
+                    gesture_func = random.choice(gestures)
+                    gesture_func()
+                
+                # 3. Short wait to keep loop reactive
+                for _ in range(20): # Sleep 2s but check flag every 100ms
+                    if not self._is_speaking_hq: break
+                    time.sleep(0.1)
+                    
+            except Exception as e:
+                print(f"⚠️ HQ Animation loop error: {e}")
+                break
+        
+        # Reset eyes when done
+        self.set_eye_color("blue")
     
     # ===== MOVEMENTS =====
     

@@ -113,29 +113,8 @@ class HybridTTSHandler:
             
             # Check for rate limit errors
             if '429' in error_msg or 'rate limit' in error_msg:
-                # Check if it's daily limit or per-minute
-                if 'day' in error_msg or 'daily' in error_msg:
-                    print("⚠️ Groq daily limit reached → trying ElevenLabs")
-                    self.groq_daily_limit_hit = True
-                    return False
-                else:
-                    print("⏳ Groq per-minute limit, waiting 60s...")
-                    time.sleep(60)
-                    # Retry once after waiting
-                    try:
-                        response = self.groq_client.audio.speech.create(
-                            model=self.groq_model,
-                            voice=self.groq_voice,
-                            input=text,
-                            response_format="wav"
-                        )
-                        with open(output_file, 'wb') as f:
-                            f.write(response.content)
-                        print("🎤 Used: Groq TTS (after retry)")
-                        return True
-                    except:
-                        print("⚠️ Groq retry failed → trying ElevenLabs")
-                        return False
+                print("⏳ Groq rate limit hit → falling back to next tier immediately")
+                return False
             else:
                 print(f"⚠️ Groq TTS error: {e}")
                 return False
