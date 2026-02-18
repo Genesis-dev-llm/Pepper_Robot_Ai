@@ -6,9 +6,9 @@ AI-powered Pepper robot with conversation, gestures, web search, and voice inter
 
 - ✅ **Natural Voice interaction**: Push-to-Talk (Hold R) → Groq Whisper STT.
 - ✅ **High-Quality Audio**: Premium voices (Groq/ElevenLabs) played via Pepper's speakers.
-- ✅ **Groq AI Brain**: Real-time conversation with context and web search.
-- ✅ **Safety Watchdog**: Movement auto-stops after 1s of inactivity (Lag protection).
-- ✅ **Speech Lock**: Prevention of overlapping audio for stable conversation.
+- 🎭 **Context-Aware Gestures**: Pepper moves naturally (nods, waves, explains) during HQ audio playback.
+- ⚡ **Zero-Latency Fallback**: Instant fallback to secondary voices or native speech—no awkward silences.
+- 🛡️ **Safety Watchdogs**: 1.0s movement timeout and speech concurrency locks for stable operation.
 - ✅ **Keyboard Controls**: Responsive WASD movement and manual gestures.
 - ✅ **AI Function Calling**: Robot performs gestures automatically based on speech.
 - ✅ **Automated Config**: Automatic `.env` loading and dependency validation.

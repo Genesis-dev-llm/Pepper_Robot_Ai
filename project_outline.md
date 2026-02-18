@@ -38,10 +38,16 @@
 
 ### ✅ PHASE 2: VOICE & AUDIO SYNC (COMPLETE)
 *Goal: Add voice conversation and high-quality physical audio.*
-- **Voice Input**: Push-to-Talk (Hold R) with Groq Whisper (`whisper-large-v3-turbo`).
-- **HQ Audio Sync**: Premium voices played via Pepper's head speakers.
-- **Hybrid TTS**: 3-tier fallback (Groq → ElevenLabs → Edge TTS).
-- **Stability Architecture**: Movement Watchdog and Speech Concurrency Locks.
+### Phase 2: Stability, Voice & HQ Audio (Feb 2026) - [COMPLETE]
+*   **Voice Input Pipeline**: Push-to-Talk (PTT) → Groq Whisper (STT) → AI Brain.
+*   **Hybrid HQ TTS**: Fast 3-tier fallback (Groq Orpheus → ElevenLabs → Edge TTS).
+*   **Safety Architecture**:
+    *   **Movement Watchdog**: 1.0s timeout to prevent runaway movement on lag.
+    *   **Speech Concurrency Locks**: Thread-safe locking to prevent NAOqi audio collisions.
+*   **Sync Improvements**:
+    *   **Physical Sync**: Background animation loop for HQ audio (gestures during playback).
+    *   **Latency Optimization**: Removed 60s rate-limit blocking for instant fallback.
+    *   **Visual Feedback**: Pulsing eye LEDs during "thinking" and "speaking" modes.
 
 #### Technical Challenges Overcome:
 - **Echo Cancellation**: Managing Pepper's built-in mics to avoid hearing her own speakers.
