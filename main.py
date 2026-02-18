@@ -1,26 +1,21 @@
 """
 Main Control Script — Pepper AI Robot
 
-Changes from original:
-- All mutable globals consolidated into a `state` SimpleNamespace so shared
-  state is explicit and easier to reason about across threads.
-- message_lock: only one AI request processed at a time. Concurrent calls
-  (e.g. voice + text arriving simultaneously) are rejected with a friendly
-  "busy" message rather than corrupting conversation history.
-- ptt_lock: threading.Lock prevents a double-fire start if the PTT key
-  somehow generates two press events before a release.
-- execute_function_calls() split into execute_gestures() (fire-and-forget
-  robot actions) and execute_search() (returns results string or None).
-  Concerns are separated; gestres never accidentally return data.
-- Smart search path: brain.needs_search(message) does a local keyword check.
-  If True, we run the search first and call chat_with_context() — ONE LLM
-  call total instead of two.  The model-driven fallback is still present for
-  edge cases not caught by keywords.
-- Movement controller: only sends NAOqi commands when the key state CHANGES,
-  not every 100ms.  Watchdog safety logic is preserved.
-- Speaking status: GUI status shows "🔊 Speaking…" during audio playback and
-  resets to "Ready" when done.
-- Voice error path now always resets recording indicator and status line.
+Changes from previous version:
+- Universal cursor gate: text_input_focused blocks ALL keys (including SPACE)
+  at the very top of on_press/on_release. No exceptions, no special cases.
+- Movement watchdog: timestamp updated on both press AND release so it only
+  fires on genuinely stuck keys (dropped key-up), not legitimately held keys.
+  Timeout raised to 2s to accommodate systems with slow/no key-repeat.
+- PTT lock: symmetric acquire/release — if the lock is acquired but ptt_active
+  is somehow already True (state desync), lock is released cleanly and we return.
+- Pepper connected guard: every pepper.* call is guarded by
+  `if pepper and pepper.connected`. System launches and chat works fully even
+  when Pepper is offline — useful for testing without the robot.
+- USE_WEB_SEARCH flag in config is now the single source of truth: both the
+  keyword fast-path and the model-driven fallback check it before running.
+- Goodbye path no longer starts thinking_indicator before checking for goodbye,
+  eliminating the start→immediate-stop visual blip.
 """
 
 import threading
@@ -40,51 +35,51 @@ from web_search_handler import WebSearchHandler
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 state = SimpleNamespace(
-    robot_active          = False,
-    running               = True,
-    ptt_active            = False,
+    robot_active           = False,
+    running                = True,
+    ptt_active             = False,
     last_movement_key_time = 0.0,
-    # Prevents concurrent AI/speech calls from corrupting history
-    message_lock          = threading.Lock(),
-    # Prevents PTT double-fire on key-repeat
-    ptt_lock              = threading.Lock(),
+    message_lock           = threading.Lock(),
+    ptt_lock               = threading.Lock(),
 )
 
 # Component handles (set in main())
-pepper:       PepperRobot      = None
-gui:          PepperDearPyGUI  = None
-brain:        GroqBrain        = None
-tts:          HybridTTSHandler = None
-web_searcher: WebSearchHandler = None
-voice:        VoiceHandler     = None
+pepper:       Optional[PepperRobot]     = None
+gui:          Optional[PepperDearPyGUI] = None
+brain:        Optional[GroqBrain]       = None
+tts:          Optional[HybridTTSHandler]= None
+web_searcher: Optional[WebSearchHandler]= None
+voice:        Optional[VoiceHandler]    = None
 
-# Movement key state
 movement_keys = {k: False for k in ('w', 's', 'a', 'd', 'q', 'e')}
 PTT_KEY = config.PTT_KEY
+
+
+# ── Pepper guard helper ───────────────────────────────────────────────────────
+
+def _pepper_ok() -> bool:
+    """True only when Pepper is present and connected."""
+    return pepper is not None and pepper.connected
 
 
 # ── Function-call helpers ─────────────────────────────────────────────────────
 
 def execute_gestures(function_calls: list):
-    """
-    Execute only physical gesture calls returned by the AI.
-    Non-blocking: each gesture runs in its own daemon thread (see PepperRobot).
-    """
-    if not function_calls:
+    if not function_calls or not _pepper_ok():
         return
     gesture_map = {
-        "wave":              pepper.wave,
-        "nod":               pepper.nod,
-        "shake_head":        pepper.shake_head,
-        "thinking_gesture":  pepper.thinking_gesture,
+        "wave":               pepper.wave,
+        "nod":                pepper.nod,
+        "shake_head":         pepper.shake_head,
+        "thinking_gesture":   pepper.thinking_gesture,
         "explaining_gesture": pepper.explaining_gesture,
-        "excited_gesture":   pepper.excited_gesture,
-        "point_forward":     pepper.point_forward,
-        "shrug":             pepper.shrug,
-        "celebrate":         pepper.celebrate,
-        "look_around":       pepper.look_around,
-        "bow":               pepper.bow,
-        "look_at_sound":     pepper.look_at_sound,
+        "excited_gesture":    pepper.excited_gesture,
+        "point_forward":      pepper.point_forward,
+        "shrug":              pepper.shrug,
+        "celebrate":          pepper.celebrate,
+        "look_around":        pepper.look_around,
+        "bow":                pepper.bow,
+        "look_at_sound":      pepper.look_at_sound,
     }
     for fn in function_calls:
         name = fn.get("name", "")
@@ -98,11 +93,8 @@ def execute_gestures(function_calls: list):
 
 
 def execute_search(function_calls: list) -> Optional[str]:
-    """
-    Execute the web_search call if present in function_calls.
-    Returns the formatted search results string, or None if no search was requested.
-    """
-    if not function_calls:
+    """Run web_search if present in function_calls AND USE_WEB_SEARCH is True."""
+    if not function_calls or not config.USE_WEB_SEARCH:
         return None
     for fn in function_calls:
         if fn.get("name") == "web_search":
@@ -116,22 +108,14 @@ def execute_search(function_calls: list) -> Optional[str]:
 # ── Message handler ───────────────────────────────────────────────────────────
 
 def handle_gui_message(message: str):
-    """
-    Process a user message: AI inference → optional web search → speech.
-
-    A non-blocking lock ensures only one message is processed at a time.
-    Concurrent calls are dropped with a friendly status message.
-    """
-    # Reject if we're already processing something
     if not state.message_lock.acquire(blocking=False):
         if gui:
             gui.update_status("⏳ Still processing — please wait")
             gui.add_system_message("(Busy processing previous message…)")
         return
 
-    # Tracks whether the finally block should reset status to "Ready".
-    # Set False on paths that leave Pepper in a non-ready state (idle, goodbye).
-    _reset_status = True
+    _thinking_started = False
+    _reset_status     = True
 
     try:
         if not state.robot_active:
@@ -141,26 +125,29 @@ def handle_gui_message(message: str):
                 gui.add_pepper_message("I'm currently idle. Press SPACE to wake me up!")
             return
 
-        if gui:
-            gui.update_status("Thinking…")
-        pepper.thinking_indicator(start=True)
-
-        # ── Goodbye shortcut ─────────────────────────────────────────
+        # ── Goodbye shortcut (checked BEFORE starting thinking indicator) ──
+        # This avoids the start→immediate-stop LED blip on goodbye.
         if config.GOODBYE_WORD.lower() in message.lower():
             _reset_status = False
             _say("Goodbye! It was nice talking with you.")
             state.robot_active = False
-            pepper.thinking_indicator(start=False)
-            pepper.wave()
-            pepper.set_eye_color("white")
+            if _pepper_ok():
+                pepper.wave()
+                pepper.set_eye_color("white")
             if gui:
                 gui.update_status("Pepper is idle")
             return
 
-        # ── Smart search fast path ───────────────────────────────────
-        # If the message clearly needs current info, search FIRST so we
-        # only need ONE LLM call (with context) instead of two.
-        if brain.needs_search(message):
+        # ── Start thinking indicator (only reached for real messages) ──────
+        if gui:
+            gui.update_status("Thinking…")
+        if _pepper_ok():
+            pepper.thinking_indicator(start=True)
+        _thinking_started = True
+
+        # ── Smart search fast path ────────────────────────────────────────
+        # config.USE_WEB_SEARCH is the single gate for all search paths.
+        if config.USE_WEB_SEARCH and brain.needs_search(message):
             if gui:
                 gui.update_status("🔍 Searching web…")
             search_results = web_searcher.search(message)
@@ -168,32 +155,36 @@ def handle_gui_message(message: str):
                 user_message=message,
                 context=search_results,
             )
-            pepper.thinking_indicator(start=False)
-            # Gestures only — search is already done
+            if _pepper_ok():
+                pepper.thinking_indicator(start=False)
+            _thinking_started = False
             execute_gestures(function_calls)
 
         else:
-            # ── Standard LLM call ────────────────────────────────────
+            # ── Standard LLM call ─────────────────────────────────────────
             response_text, function_calls = brain.chat(message)
 
-            # Model may have decided to search on its own
+            # Model may have decided to search on its own (respects USE_WEB_SEARCH)
             search_results = execute_search(function_calls)
 
             if search_results:
-                # Second call with context (model-driven search path)
                 if gui:
                     gui.update_status("🔍 Processing search results…")
                 response_text, function_calls = brain.chat_with_context(
                     user_message=message,
                     context=search_results,
                 )
-                pepper.thinking_indicator(start=False)
+                if _pepper_ok():
+                    pepper.thinking_indicator(start=False)
+                _thinking_started = False
                 execute_gestures(function_calls)
             else:
-                pepper.thinking_indicator(start=False)
+                if _pepper_ok():
+                    pepper.thinking_indicator(start=False)
+                _thinking_started = False
                 execute_gestures(function_calls)
 
-        # ── Speak & display ──────────────────────────────────────────
+        # ── Speak & display ───────────────────────────────────────────────
         if response_text:
             if gui:
                 gui.add_pepper_message(response_text)
@@ -207,7 +198,8 @@ def handle_gui_message(message: str):
     except Exception as e:
         print(f"❌ Message handling error: {e}")
         import traceback; traceback.print_exc()
-        pepper.thinking_indicator(start=False)
+        if _thinking_started and _pepper_ok():
+            pepper.thinking_indicator(start=False)
         if gui:
             gui.update_status("Error — Ready")
             gui.add_pepper_message("Sorry, I encountered an error.")
@@ -218,16 +210,17 @@ def handle_gui_message(message: str):
 
 
 def _say(text: str):
-    """
-    Speak text via HQ pipeline (or NAOqi fallback) and update GUI status.
-    Always called from a worker thread — never blocks the GUI.
-    """
-    if gui:
+    if gui and gui.is_running:
         gui.update_status("🔊 Speaking…")
     try:
-        pepper.speak_hq(text, tts)
+        if _pepper_ok():
+            pepper.speak_hq(text, tts)
+        else:
+            # No robot — just play audio locally via TTS handler
+            if tts:
+                tts.speak_and_play(text)
     finally:
-        if gui:
+        if gui and gui.is_running:
             gui.update_status("Ready")
 
 
@@ -235,75 +228,79 @@ def _say(text: str):
 
 def on_press(key):
     try:
-        # ── Typing guard ─────────────────────────────────────────────
-        # If the user is typing in the GUI text box, let ALL keys pass
-        # through as normal characters — don't trigger any robot commands.
-        # Exception: Escape always works so the user can quit even while
-        # the text box is focused.
-        is_typing = bool(gui and gui.text_input_focused)
-
-        # ── Escape — quit (always active, even while typing) ─────────
-        if key == keyboard.Key.esc:
-            print("\n👋 Shutting down…")
-            state.running = False
-            return
-
-        # Block all other robot commands while the text box is focused
-        if is_typing:
+        # ── Universal cursor gate ─────────────────────────────────────────
+        # If the text input box is focused (cursor visible), every key goes
+        # to typing — nothing reaches the robot. No exceptions.
+        if gui and gui.text_input_focused:
             return
 
         # Extract character for char-key branches
         k = key.char if hasattr(key, "char") and key.char else None
 
-        # ── Space — toggle active/idle ────────────────────────────────
-        # Space is keyboard.Key.space (special key), NOT key.char == ' '
+        # ── Escape — quit ─────────────────────────────────────────────────
+        if key == keyboard.Key.esc:
+            print("\n👋 Shutting down…")
+            state.running = False
+            # Setting gui.is_running = False is a plain bool write — thread-safe.
+            # The render loop checks this flag and exits on the next frame,
+            # calling dpg.destroy_context() from the main thread where it's safe.
+            if gui:
+                gui.is_running = False
+            return
+
+        # ── Space — toggle active/idle ────────────────────────────────────
         if key == keyboard.Key.space:
             state.robot_active = not state.robot_active
             label = "ACTIVE 🟢" if state.robot_active else "IDLE 🔴"
             print(f"\n{'='*50}\nPepper is now {label}\n{'='*50}\n")
-            pepper.set_eye_color("blue" if state.robot_active else "white")
+            if _pepper_ok():
+                pepper.set_eye_color("blue" if state.robot_active else "white")
             if gui:
                 gui.update_status("Active — ready" if state.robot_active else "Idle")
             return
 
         if k is None:
-            return  # Unhandled special key — ignore
+            return
 
-        # ── PTT ──────────────────────────────────────────────────────
+        # ── PTT ───────────────────────────────────────────────────────────
         if k == PTT_KEY and config.VOICE_ENABLED:
-            # Use lock to prevent double-fire on key-repeat
             acquired = state.ptt_lock.acquire(blocking=False)
             if not acquired:
                 return  # Already recording
 
-            if not state.ptt_active:
-                state.ptt_active = True
-                if voice:
-                    started = voice.start_recording()
-                    if started and gui:
-                        gui.set_recording(True)
-                        gui.update_status("🎙️ Recording… release R when done")
-                    else:
-                        # Failed to start — release lock
-                        state.ptt_active = False
-                        state.ptt_lock.release()
+            # Safety: if state somehow desynchronised, release and bail
+            if state.ptt_active:
+                state.ptt_lock.release()
+                return
+
+            state.ptt_active = True
+            if voice:
+                started = voice.start_recording()
+                if started and gui:
+                    gui.set_recording(True)
+                    gui.update_status("🎙️ Recording… release R when done")
+                else:
+                    state.ptt_active = False
+                    state.ptt_lock.release()
             return
 
-        # ── Movement ─────────────────────────────────────────────────
+        # ── Movement ──────────────────────────────────────────────────────
         if k in movement_keys:
-            movement_keys[k]            = True
+            movement_keys[k]             = True
             state.last_movement_key_time = time.time()
+            return
 
-        # ── Gestures ─────────────────────────────────────────────────
-        elif k == '1': pepper.wave()
+        # ── Gestures ──────────────────────────────────────────────────────
+        if not _pepper_ok():
+            return  # Silently ignore gesture keys when not connected
+
+        if   k == '1': pepper.wave()
         elif k == '2': pepper.nod()
         elif k == '3': pepper.shake_head()
         elif k == '4': pepper.thinking_gesture()
         elif k == '8': pepper.explaining_gesture()
         elif k == '9': pepper.excited_gesture()
         elif k == '0': pepper.point_forward()
-
-        # ── LEDs ─────────────────────────────────────────────────────
         elif k == '5': pepper.set_eye_color("blue")
         elif k == '6': pepper.set_eye_color("green")
         elif k == '7': pepper.set_eye_color("red")
@@ -314,16 +311,12 @@ def on_press(key):
 
 def on_release(key):
     try:
-        # ── Escape (already handled in on_press, nothing to release) ──
-        if key == keyboard.Key.esc:
-            return
-
+        # ── Universal cursor gate (release) ──────────────────────────────
+        # PTT release must always fire to prevent recording getting stuck,
+        # even if the user clicked into the text box mid-recording.
         k = key.char if hasattr(key, "char") and key.char else None
 
-        # ── PTT release ──────────────────────────────────────────────
-        # PTT release always fires regardless of text_input_focused so
-        # that recording is never left open if the user clicks into the
-        # text box mid-recording and then releases R.
+        # ── PTT release — always processed regardless of text focus ──────
         if k == PTT_KEY and config.VOICE_ENABLED:
             if state.ptt_active:
                 state.ptt_active = False
@@ -334,14 +327,19 @@ def on_release(key):
                 try:
                     state.ptt_lock.release()
                 except RuntimeError:
-                    pass  # Already released somehow
+                    pass
             return
 
-        # ── Movement key released ─────────────────────────────────────
-        # Always reset regardless of typing state — prevents a key getting
-        # "stuck" held if the user clicks into the text box while moving.
+        # All other releases are gated the same as presses
+        if gui and gui.text_input_focused:
+            return
+
+        # ── Movement key released ─────────────────────────────────────────
         if k in movement_keys:
-            movement_keys[k] = False
+            movement_keys[k]             = False
+            # Update timestamp on release too — watchdog only fires on
+            # genuinely stuck keys (dropped release), not held keys.
+            state.last_movement_key_time = time.time()
 
     except AttributeError:
         pass
@@ -352,16 +350,24 @@ def on_release(key):
 def movement_controller():
     """
     Sends NAOqi move commands only when the active-key state CHANGES.
-    The watchdog still fires after 1s of silence to handle dropped releases.
+
+    Watchdog fires after WATCHDOG_TIMEOUT seconds of no key activity while
+    movement keys appear pressed — catches dropped key-up events.
+    Timeout is 2s (raised from 1s) to avoid falsely stopping on systems
+    where OS key-repeat is slow or disabled.
     """
-    WATCHDOG_TIMEOUT = 1.0
+    WATCHDOG_TIMEOUT = 2.0
     prev_state       = None
 
     while state.running:
         try:
+            if not _pepper_ok():
+                time.sleep(0.1)
+                continue
+
             any_pressed = any(movement_keys.values())
 
-            # Watchdog: force-stop if keys look held but no recent event
+            # Watchdog: force-stop if keys look held but no event in 2s
             if any_pressed and (time.time() - state.last_movement_key_time > WATCHDOG_TIMEOUT):
                 for k in movement_keys:
                     movement_keys[k] = False
@@ -370,14 +376,12 @@ def movement_controller():
                 time.sleep(0.1)
                 continue
 
-            # Snapshot current state
             current = (
                 movement_keys['w'], movement_keys['s'],
                 movement_keys['a'], movement_keys['d'],
                 movement_keys['q'], movement_keys['e'],
             )
 
-            # Only dispatch when something changed
             if current != prev_state:
                 w, s, a, d, q, e = current
                 if   w: pepper.move_forward()
@@ -389,7 +393,7 @@ def movement_controller():
                 else:   pepper.stop_movement()
                 prev_state = current
 
-            time.sleep(0.05)   # 20 Hz polling (only to catch watchdog)
+            time.sleep(0.05)
 
         except Exception as ex:
             print(f"❌ Movement controller error: {ex}")
@@ -404,21 +408,21 @@ def print_controls():
     print("🎮 PEPPER ROBOT CONTROLS")
     print("="*60)
     print(f"\n🎙️ VOICE (Push-to-Talk):")
-    print(f"  Hold {ptt}     - Speak  →  release  →  auto-transcribes")
+    print(f"  Hold {ptt}     - Speak → release → auto-transcribes")
     print("\n💬 TEXT:")
-    print("  Click the GUI text box and type, then Enter / Send")
-    print("  (robot controls are disabled while typing in the box)")
-    print("\n🤖 MOVEMENT (hold key — focus must be outside text box):")
+    print("  Click the GUI input box to type (robot controls suspended)")
+    print("  Press Enter or Send to send (robot controls restored)")
+    print("\n🤖 MOVEMENT (input box must NOT be focused):")
     print("  W/S     - Forward / Backward")
     print("  A/D     - Turn Left / Right")
     print("  Q/E     - Strafe Left / Right")
-    print("\n✋ MANUAL GESTURES (tap):")
+    print("\n✋ GESTURES (tap, input box not focused):")
     print("  1=Wave  2=Nod  3=Shake  4=Think  8=Explain  9=Excited  0=Point")
     print("\n💡 LEDs:")
     print("  5=Blue  6=Green  7=Red")
     print("\n⚙️ SYSTEM:")
-    print("  SPACE   - Toggle Active / Idle  (click outside text box first)")
-    print("  ESC     - Quit  (works even while typing)")
+    print("  SPACE   - Toggle Active / Idle  (input box must NOT be focused)")
+    print("  ESC     - Quit")
     print(f"\n  Wake: '{config.WAKE_WORD}'   Goodbye: '{config.GOODBYE_WORD}'")
     print("\n🧠 AI triggers gestures automatically during conversation!")
     print("="*60 + "\n")
@@ -443,10 +447,10 @@ def main():
     pepper = PepperRobot(config.PEPPER_IP, config.PEPPER_PORT,
                          ssh_user=config.PEPPER_SSH_USER,
                          ssh_password=config.PEPPER_SSH_PASS)
-    if not pepper.connect():
-        print("❌ Failed to connect. Check PEPPER_IP in .env")
-        return
-    pepper.set_eye_color("white")
+    pepper.connect()
+    # connect() handles all success/failure/timeout messaging internally.
+    # If it returns False, pepper.connected == False and the system runs
+    # in offline mode — all pepper.* calls are guarded by _pepper_ok().
 
     # 3. AI Brain ──────────────────────────────────────────────────────
     print("\n3️⃣  Initialising AI brain…")
@@ -473,7 +477,8 @@ def main():
     # 5. Web Search ────────────────────────────────────────────────────
     print("\n5️⃣  Initialising web search…")
     web_searcher = WebSearchHandler(max_results=3, timeout=8.0)
-    print("   ✅ DuckDuckGo search ready (free, unlimited, 8s timeout)")
+    search_status = "enabled" if config.USE_WEB_SEARCH else "disabled (USE_WEB_SEARCH=False)"
+    print(f"   ✅ DuckDuckGo search ready — {search_status}")
 
     # 6. Voice Handler ─────────────────────────────────────────────────
     print("\n6️⃣  Initialising voice (STT)…")
@@ -508,12 +513,10 @@ def main():
             print(f"📝 Transcribed: \"{text}\"")
             if gui:
                 gui.add_voice_user_message(text)
-                # add_voice_user_message queues the message_callback call
 
         def _on_error(msg: str):
             print(f"🎙️ Voice error: {msg}")
             if gui:
-                # Always reset both status and recording indicator on error
                 gui.set_recording(False)
                 gui.update_status(f"Voice error: {msg}")
 
@@ -541,10 +544,14 @@ def main():
     print_controls()
 
     gui = PepperDearPyGUI(handle_gui_message)
-    gui.update_status("Idle — press SPACE to activate Pepper")
+
+    if _pepper_ok():
+        gui.update_status("Idle — press SPACE to activate Pepper")
+    else:
+        gui.update_status("⚠️ Pepper offline — chat only mode")
 
     try:
-        gui.start()         # Blocks until window closed
+        gui.start()
     except KeyboardInterrupt:
         print("\n\n⚠️  Interrupted by user")
     finally:

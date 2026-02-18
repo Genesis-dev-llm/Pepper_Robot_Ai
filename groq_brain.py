@@ -2,14 +2,17 @@
 Groq Brain - LLM and Speech-to-Text
 
 Key design decisions:
-- chat()               — standard turn; user message only added to history on success
-- chat_with_context()  — self-contained; does NOT require chat() to have been called first;
-                         injects search/tool results as a system message for a single LLM call
-- needs_search()       — fast keyword heuristic so main.py can skip the intent-detection
-                         round-trip and go straight to search → single LLM call
+- chat()               — standard turn; if the model returns only tool calls
+                         with no text, a follow-up call is made automatically
+                         to get the verbal response, so the robot always speaks.
+- chat_with_context()  — self-contained; injects search/tool results as a system
+                         message for a single LLM call.
+- needs_search()       — fast keyword heuristic; only active when USE_WEB_SEARCH
+                         is True in config.
 """
 
 import json
+import re
 import threading
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -23,7 +26,6 @@ import config
 # ---------------------------------------------------------------------------
 
 def _parse_tool_calls(message) -> List[Dict]:
-    """Extract function-call dicts from a Groq response message."""
     calls = []
     if hasattr(message, "tool_calls") and message.tool_calls:
         for tc in message.tool_calls:
@@ -35,18 +37,37 @@ def _parse_tool_calls(message) -> List[Dict]:
     return calls
 
 
+def _clean_response_text(text: str) -> str:
+    """
+    Strip any function/tool call artifacts or stage directions the model
+    leaked into its spoken text.
+
+    Patterns removed:
+    - <function=name></function> and variants (XML-style tool calls)
+    - *action* asterisk stage directions (e.g. *nods*, *pauses*, *waves*)
+    - Bare gesture names on their own line (e.g. "Watch this.\nwave")
+    """
+    # XML-style function tags
+    text = re.sub(r"<function=[^>]*>.*?</function>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<function=[^>/]*/?>", "", text)
+    text = re.sub(r"<tool[^>]*>.*?</tool>", "", text, flags=re.DOTALL)
+    # Asterisk stage directions — *word* or *multiple words*
+    text = re.sub(r"\*[^*]+\*", "", text)
+    # Bare gesture/function names on their own line
+    _GESTURE_NAMES = {
+        "wave", "nod", "shake_head", "thinking_gesture", "explaining_gesture",
+        "excited_gesture", "point_forward", "shrug", "celebrate", "look_around",
+        "bow", "look_at_sound", "web_search",
+    }
+    lines = text.splitlines()
+    lines = [l for l in lines if l.strip().lower() not in _GESTURE_NAMES]
+    return "\n".join(lines).strip()
+
+
 def _sanitize_history(history: List[Dict]) -> List[Dict]:
     """
-    Return a clean copy of conversation history safe to send to the Groq API.
-
-    Groq validates that any tool_calls in assistant messages are also listed
-    in request.tools with matching names.  If a prior model turn generated a
-    malformed tool name (e.g. 'look_around{}') or the history was built from
-    a different tools list, the API returns a 400.
-
-    Fix: strip all tool_calls metadata from assistant messages — keep only
-    the text content.  We never need the raw tool call objects in history;
-    the actual results were always handled at call time, not replayed.
+    Strip tool_calls metadata from assistant messages so the API never
+    sees stale/malformed tool call objects from prior turns.
     """
     clean = []
     for msg in history:
@@ -72,18 +93,15 @@ class GroqBrain:
         use_web_search: bool = False,
         compound_model: Optional[str] = None,
     ):
-        self.client        = Groq(api_key=api_key)
+        self.client         = Groq(api_key=api_key)
         self.use_web_search = use_web_search
-        self.llm_model     = compound_model if use_web_search and compound_model else llm_model
-        self.whisper_model = whisper_model
-        self.system_prompt = system_prompt
-        self.functions     = functions
+        self.llm_model      = compound_model if use_web_search and compound_model else llm_model
+        self.whisper_model  = whisper_model
+        self.system_prompt  = system_prompt
+        self.functions      = functions
 
-        # Conversation history — only confirmed turns live here
         self.conversation_history: List[Dict] = []
         self.max_history = 10
-
-        # Thread safety: only one LLM call should write history at a time
         self._history_lock = threading.Lock()
 
         search_mode = "with WEB SEARCH" if use_web_search else "without web search"
@@ -94,7 +112,6 @@ class GroqBrain:
     # ------------------------------------------------------------------
 
     def transcribe_audio(self, audio_file_path: str) -> Optional[str]:
-        """Transcribe an audio file using Groq Whisper."""
         try:
             with open(audio_file_path, "rb") as f:
                 result = self.client.audio.transcriptions.create(
@@ -104,8 +121,6 @@ class GroqBrain:
                     language="en",
                 )
             text = result.strip()
-            if text:
-                print(f"🎤 Transcribed: '{text}'")
             return text or None
         except Exception as e:
             print(f"❌ Transcription error: {e}")
@@ -119,14 +134,13 @@ class GroqBrain:
         """
         Standard chat turn.
 
-        The user message is only committed to history after a successful
-        API response — preventing dangling messages on failure.
-
-        Returns:
-            (response_text, function_calls | None)
+        If the model returns ONLY tool calls with no text (common when it
+        decides to gesture without speaking), a follow-up call is made
+        without tools to get the verbal response. This ensures the robot
+        always has something to say rather than falling back to the generic
+        "Sorry, I didn't catch that" message.
         """
         try:
-            # Build message list WITHOUT mutating history yet
             messages = (
                 [{"role": "system", "content": self.system_prompt}]
                 + _sanitize_history(self.conversation_history)
@@ -151,16 +165,17 @@ class GroqBrain:
                     max_tokens=150,
                 )
 
-            message       = response.choices[0].message
-            response_text  = message.content or ""
+            message        = response.choices[0].message
+            response_text  = _clean_response_text(message.content or "")
             function_calls = _parse_tool_calls(message)
 
-            # ✅ Only commit when there is a real text reply.
-            # If the model returned ONLY a tool call (empty response_text), do NOT
-            # commit yet — the caller will follow up with chat_with_context() which
-            # will commit the complete user+final_answer exchange.  Committing here
-            # would leave a dangling user message that chat_with_context() then
-            # duplicates, corrupting history.
+            # ── Follow-up if model returned only tool calls ────────────
+            # When the model calls gestures but forgets to include text,
+            # ask it once more (no tools) to get the verbal response.
+            if function_calls and not response_text:
+                response_text = self._get_verbal_response(messages, function_calls)
+
+            # ── Commit to history only when we have a real text reply ──
             if response_text:
                 with self._history_lock:
                     self.conversation_history.append(
@@ -179,6 +194,46 @@ class GroqBrain:
             import traceback; traceback.print_exc()
             return None, None
 
+    def _get_verbal_response(
+        self,
+        prior_messages: List[Dict],
+        function_calls: List[Dict],
+    ) -> str:
+        """
+        Follow-up call when the model returned only tool calls with no text.
+        Tells the model which gestures it already chose, asks for the verbal
+        response only (no tools this time so it can't loop).
+        """
+        try:
+            gesture_names = [f["name"] for f in function_calls if f["name"] != "web_search"]
+            context = ""
+            if gesture_names:
+                context = f"[You already chose to perform: {', '.join(gesture_names)}] "
+
+            followup_messages = prior_messages + [{
+                "role": "system",
+                "content": (
+                    context +
+                    "Now provide your spoken response to the user. "
+                    "Keep it to 1-3 sentences."
+                ),
+            }]
+
+            response = self.client.chat.completions.create(
+                model=self.llm_model,
+                messages=followup_messages,
+                temperature=0.7,
+                max_tokens=150,
+                # No tools — we just want text
+            )
+            text = _clean_response_text(response.choices[0].message.content or "")
+            if text:
+                print("🔄 Follow-up call got verbal response")
+            return text
+        except Exception as e:
+            print(f"⚠️  Follow-up verbal response failed: {e}")
+            return ""
+
     def chat_with_context(
         self,
         user_message: str,
@@ -186,15 +241,7 @@ class GroqBrain:
     ) -> Tuple[Optional[str], Optional[List[Dict]]]:
         """
         Single LLM call with injected context (search results, tool output, etc.).
-
-        Completely self-contained — does NOT require chat() to have been called
-        first.  The user message and final answer are both committed to history.
-
-        The context is injected as a system message so it doesn't pollute the
-        visible conversation history with raw data blobs.
-
-        Returns:
-            (response_text, function_calls | None)
+        Self-contained — commits user message and final answer to history.
         """
         try:
             messages = (
@@ -220,10 +267,13 @@ class GroqBrain:
             )
 
             message        = response.choices[0].message
-            response_text  = message.content or ""
+            response_text  = _clean_response_text(message.content or "")
             function_calls = _parse_tool_calls(message)
 
-            # ✅ Commit user message + answer to history
+            # Same follow-up logic as chat()
+            if function_calls and not response_text:
+                response_text = self._get_verbal_response(messages, function_calls)
+
             with self._history_lock:
                 self.conversation_history.append(
                     {"role": "user", "content": user_message}
@@ -247,15 +297,8 @@ class GroqBrain:
 
     def needs_search(self, message: str) -> bool:
         """
-        Fast keyword heuristic to detect whether a message is likely to
-        benefit from a web search.
-
-        When this returns True, main.py should:
-          1. Run the search immediately
-          2. Call chat_with_context(message, results)   ← ONE LLM call total
-
-        When False, call chat(message) as normal.  The model may still emit
-        a web_search function call for edge cases not caught by keywords.
+        Keyword heuristic for the search fast-path.
+        Only called when USE_WEB_SEARCH = True in config.
         """
         lowered = message.lower()
         return any(kw in lowered for kw in config.SEARCH_KEYWORDS)
@@ -270,7 +313,6 @@ class GroqBrain:
         print("🔄 Conversation history cleared")
 
     def add_context(self, context: str):
-        """Prepend a system-level context note (e.g. vision info)."""
         with self._history_lock:
             self.conversation_history.insert(
                 0, {"role": "system", "content": f"Current context: {context}"}
@@ -281,7 +323,6 @@ class GroqBrain:
     # ------------------------------------------------------------------
 
     def _trim_history(self):
-        """Keep only the most recent max_history exchanges. Call inside lock."""
         cap = self.max_history * 2
         if len(self.conversation_history) > cap:
             self.conversation_history = self.conversation_history[-cap:]

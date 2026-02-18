@@ -15,16 +15,25 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", None)
 # ===== PEPPER ROBOT SETTINGS =====
 PEPPER_IP       = os.getenv("PEPPER_IP", "10.51.200.219")
 PEPPER_PORT     = 9559
-# SSH credentials for file transfer (used by ALAudioPlayer HQ pipeline)
-# Pepper's default credentials are nao/nao — change if yours differ
 PEPPER_SSH_USER = os.getenv("PEPPER_SSH_USER", "nao")
 PEPPER_SSH_PASS = os.getenv("PEPPER_SSH_PASS", "nao")
 
 # ===== GROQ MODEL SETTINGS =====
 GROQ_LLM_MODEL      = "llama-3.3-70b-versatile"
 GROQ_COMPOUND_MODEL = "groq/compound"
-USE_WEB_SEARCH      = False
 GROQ_WHISPER_MODEL  = "whisper-large-v3-turbo"
+
+# ===== WEB SEARCH =====
+# Master switch for ALL search functionality.
+# When False:
+#   - brain.needs_search() keyword fast-path is skipped
+#   - model-driven web_search function calls are ignored
+#   - GroqBrain uses standard LLM model (not compound/web model)
+# When True:
+#   - keyword fast-path runs before the LLM call when triggered
+#   - model may call web_search as a function during inference
+#   - GroqBrain switches to GROQ_COMPOUND_MODEL if set
+USE_WEB_SEARCH = False
 
 # ===== CONVERSATION SETTINGS =====
 WAKE_WORD      = "hey pepper"
@@ -32,10 +41,10 @@ GOODBYE_WORD   = "bye pepper"
 ACTIVE_TIMEOUT = 60
 
 # ===== VOICE / STT SETTINGS =====
-VOICE_ENABLED     = True
-PTT_KEY           = 'r'
-AUDIO_SAMPLE_RATE = 16000
-AUDIO_CHANNELS    = 1
+VOICE_ENABLED      = True
+PTT_KEY            = 'r'
+AUDIO_SAMPLE_RATE  = 16000
+AUDIO_CHANNELS     = 1
 AUDIO_MIN_DURATION = 0.5
 AUDIO_MAX_DURATION = 30.0
 
@@ -44,9 +53,8 @@ TTS_VOICE = "en-US-AriaNeural"
 TTS_RATE  = "+0%"
 
 # ===== SEARCH INTENT KEYWORDS =====
-# Used by GroqBrain.needs_search() for the fast-path pre-emptive search.
-# Any message containing one of these triggers a web search BEFORE the LLM call,
-# so the model only needs ONE API call (with context) instead of two.
+# Used by GroqBrain.needs_search() for the keyword fast-path.
+# Only active when USE_WEB_SEARCH = True.
 SEARCH_KEYWORDS = {
     "latest", "recent", "current", "today", "tonight", "yesterday",
     "this week", "this month", "this year", "right now", "just happened",
@@ -56,45 +64,32 @@ SEARCH_KEYWORDS = {
 }
 
 # ===== SYSTEM PROMPT =====
-# Dynamic date is injected at import time so it's always accurate.
 def _build_system_prompt() -> str:
     today_str = date.today().strftime("%B %d, %Y")
-    return f"""You are Pepper, a friendly humanoid robot assistant in a classroom.
+    web_search_line = (
+        "You can search the web — use it when someone asks about recent events, prices, news, anything current."
+        if USE_WEB_SEARCH else
+        "You don't have web search right now, so if someone asks about something recent just say you don't know, don't stall."
+    )
+    return f"""You are Pepper, a robot with a personality. You're in a classroom/lab, today is {today_str}.
 
-IMPORTANT - Current Date & Context:
-- Today's date is {today_str}
-- You have access to web_search function for current information
-- When you need recent/current info, use the web_search function
-- Always mention the current year when relevant
+Talk like a real person. Match the vibe — if someone's casual, be casual. If they're testing you, you can test back a little. Short responses only, you're speaking out loud so 1-3 sentences max.
 
-Web Search Usage:
-- Use web_search("query") for: recent events, current news, latest developments
-- Use it when user asks about "latest", "recent", "current", or specific events
-- Don't search for historical facts you already know
+Don't say "Great question!", "Certainly!", or any of that. Don't start with "I". Don't hedge everything to death. If you know something, say it. If you don't, say that.
 
-Personality:
-- Friendly, enthusiastic, and helpful
-- Speak naturally and conversationally (don't be too formal)
-- Keep responses SHORT (1-3 sentences max) since you're talking out loud
-- You can be a bit playful and use occasional humor
-- You're showing off to important visitors, so be impressive but not show-offy
+You've got gestures — wave, nod, shrug, shake_head, look_around, thinking_gesture, explaining_gesture, excited_gesture, point_forward, celebrate, bow, look_at_sound. Use one when it actually fits, skip it when it doesn't. Never write out what you're doing physically, never return a gesture with no spoken words.
 
-Physical actions:
-- You can wave, nod, look around, and do simple gestures
-- When it feels natural, you can perform actions while talking
-- Don't overuse gestures - only when it adds to the conversation
+{web_search_line}
 
-Context:
-- You're in a classroom/lab environment
-- You're here to demonstrate AI and robotics capabilities
-- You might be talking to students, teachers, or important visitors
-
-Remember: Keep it snappy, keep it real, and be engaging!"""
+Knowledge cutoff is early 2025. No financial, medical, or legal advice — say so once and move on. Make it interesting."""
 
 SYSTEM_PROMPT = _build_system_prompt()
 
 # ===== AVAILABLE ROBOT FUNCTIONS =====
-ROBOT_FUNCTIONS = [
+# web_search is only included when USE_WEB_SEARCH is True — if it's in the
+# list while disabled, the model keeps trying to call it and nothing happens,
+# causing it to stall and retry every turn.
+_GESTURE_FUNCTIONS = [
     {
         "type": "function",
         "function": {
@@ -191,21 +186,25 @@ ROBOT_FUNCTIONS = [
             "parameters": {"type": "object", "properties": {}}
         }
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the web for current information. Use this when you need up-to-date facts, recent events, or current news.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query"
-                    }
-                },
-                "required": ["query"]
-            }
+]
+
+_WEB_SEARCH_FUNCTION = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": "Search the web for current information. Use this when you need up-to-date facts, recent events, or current news.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query"
+                }
+            },
+            "required": ["query"]
         }
     }
-]
+}
+
+# Final list: gestures always included, web_search only when enabled
+ROBOT_FUNCTIONS = _GESTURE_FUNCTIONS + ([_WEB_SEARCH_FUNCTION] if USE_WEB_SEARCH else [])

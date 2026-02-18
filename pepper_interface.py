@@ -1,17 +1,17 @@
 """
 Pepper Robot Interface — NAOqi hardware control
 
-Changes from original:
-- All public gesture methods are now non-blocking (fire-and-forget via daemon
-  threads).  A gesture lock ensures they don't physically overlap; a new
-  request while one is running is silently skipped rather than queuing up.
-- play_audio_file() SCPs the audio file to the robot's /tmp/ directory before
-  calling ALAudioPlayer.loadFile() — Pepper's audio player runs on the robot
-  and cannot access paths on the laptop's filesystem.
-- thinking_indicator() now spawns a real background pulse loop instead of just
-  setting the LED colour twice.
-- speak_hq() is a first-class method: generate HQ audio via a TTS handler,
-  play through ALAudioPlayer, fall back to built-in TTS on any failure.
+Changes from previous version:
+- self.connected flag added so callers can guard all hardware calls gracefully
+  (covers both "never connected" and "dropped mid-session" cases).
+- qi import is now guarded — if NAOqi is not installed the module still loads
+  and PepperRobot can be instantiated; connect() will simply return False and
+  set connected=False, allowing the rest of the system to run in offline mode.
+- _hq_speech_animation_loop now calls public gesture methods (nod, explaining_gesture,
+  etc.) instead of _impl methods directly, so the gesture lock is always respected
+  and user-triggered gestures can't fight the animation loop.
+- play_audio_file reuses the original SSH connection for remote cleanup instead of
+  opening a second connection, halving the auth handshakes on every audio play.
 """
 
 import os
@@ -20,10 +20,15 @@ import threading
 import time
 from typing import Optional, TYPE_CHECKING
 
-import qi
+try:
+    import qi
+    _QI_AVAILABLE = True
+except ImportError:
+    qi = None
+    _QI_AVAILABLE = False
+    print("⚠️  NAOqi (qi) not installed — Pepper hardware unavailable")
+    print("   Running in offline/chat-only mode")
 
-# paramiko is used to SCP audio files to the robot.
-# If not installed: pip install paramiko --break-system-packages
 try:
     import paramiko
     _PARAMIKO_AVAILABLE = True
@@ -44,38 +49,70 @@ class PepperRobot:
         self.ssh_user     = ssh_user
         self.ssh_password = ssh_password
 
+        # Set to True only after a successful connect() call.
+        # All callers should guard: if pepper.connected: pepper.wave()
+        self.connected = False
+
         # NAOqi services (set in connect())
-        self.session        = None
-        self.tts            = None
-        self.motion         = None
+        self.session         = None
+        self.tts             = None
+        self.motion          = None
         self.animated_speech = None
-        self.audio          = None
-        self.leds           = None
-        self.awareness      = None
+        self.audio           = None
+        self.leds            = None
+        self.awareness       = None
 
-        # Speech concurrency — acquired for the duration of any speech output.
-        self._speech_lock = threading.Lock()
-
-        # Gesture concurrency — skip new gesture if one is already running.
+        self._speech_lock  = threading.Lock()
         self._gesture_lock = threading.Lock()
 
-        # Thinking-indicator state
-        self._thinking         = False
+        self._thinking        = False
         self._thinking_thread: Optional[threading.Thread] = None
 
-        # HQ audio animation state
         self._is_speaking_hq = False
 
     # ------------------------------------------------------------------
     # Connection
     # ------------------------------------------------------------------
 
-    def connect(self) -> bool:
-        try:
-            print(f"🤖 Connecting to Pepper at {self.ip}:{self.port}…")
-            self.session = qi.Session()
-            self.session.connect(f"tcp://{self.ip}:{self.port}")
+    def connect(self, timeout: float = 5.0) -> bool:
+        if not _QI_AVAILABLE:
+            print("⚠️  qi not available — cannot connect to Pepper (offline mode)")
+            self.connected = False
+            return False
 
+        print(f"🤖 Connecting to Pepper at {self.ip}:{self.port} (timeout {timeout}s)…")
+
+        # qi.Session.connect() blocks indefinitely on unreachable IPs.
+        # Run it in a thread so we can enforce a timeout and fall through
+        # to offline mode instead of hanging the entire startup.
+        _result = {"success": False, "error": None}
+
+        def _attempt():
+            try:
+                session = qi.Session()
+                session.connect(f"tcp://{self.ip}:{self.port}")
+                _result["session"] = session
+                _result["success"] = True
+            except Exception as e:
+                _result["error"] = e
+
+        t = threading.Thread(target=_attempt, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+
+        if not _result["success"]:
+            if t.is_alive():
+                print(f"⏱️  Connection timed out after {timeout}s — launching in offline mode")
+            else:
+                print(f"❌ Connection failed: {_result['error']} — launching in offline mode")
+            print("   Chat, TTS and web search will still work.")
+            print("   Robot controls and gestures will be silently ignored.")
+            self.connected = False
+            return False
+
+        # Connection succeeded — grab the session and initialise services
+        self.session = _result["session"]
+        try:
             self.tts             = self.session.service("ALTextToSpeech")
             self.motion          = self.session.service("ALMotion")
             self.animated_speech = self.session.service("ALAnimatedSpeech")
@@ -85,9 +122,11 @@ class PepperRobot:
 
             self.motion.wakeUp()
             time.sleep(1)
+            self.connected = True
             print("✅ Connected to Pepper!")
             return True
         except Exception as e:
+            self.connected = False
             print(f"❌ Connection failed: {e}")
             return False
 
@@ -98,13 +137,14 @@ class PepperRobot:
             print("👋 Disconnected from Pepper")
         except Exception as e:
             print(f"⚠️  Disconnect error: {e}")
+        finally:
+            self.connected = False
 
     # ------------------------------------------------------------------
     # Speech — built-in NAOqi TTS
     # ------------------------------------------------------------------
 
     def speak(self, text: str, use_animation: bool = True):
-        """Blocking built-in TTS (thread-safe)."""
         with self._speech_lock:
             try:
                 if use_animation and self.animated_speech:
@@ -125,15 +165,6 @@ class PepperRobot:
     # ------------------------------------------------------------------
 
     def speak_hq(self, text: str, tts_handler: "HybridTTSHandler") -> bool:
-        """
-        Generate audio via the hybrid TTS handler and play through
-        ALAudioPlayer (Pepper's own speakers).
-
-        Falls back to built-in NAOqi TTS on any failure so there is
-        always some voice output.
-
-        Returns True if HQ path succeeded, False if fallback was used.
-        """
         try:
             audio_path = tts_handler.speak(text)
             if audio_path and self.play_audio_file(audio_path):
@@ -145,22 +176,14 @@ class PepperRobot:
         except Exception as e:
             print(f"⚠️  HQ TTS pipeline error: {e}")
 
-        # Fallback
         print("↩️  Falling back to built-in NAOqi TTS")
         self.speak(text)
         return False
 
     def play_audio_file(self, file_path: str, lock_timeout: float = 0.5) -> bool:
         """
-        Play an audio file through Pepper's speakers via ALAudioPlayer.
-
-        Because ALAudioPlayer runs on the robot, it cannot access paths on the
-        laptop filesystem.  This method:
-          1. SCPs the file to /tmp/ on the robot via paramiko/SFTP.
-          2. Calls ALAudioPlayer.loadFile() with the remote path.
-          3. Cleans up the remote file when done.
-
-        Falls back gracefully if paramiko is unavailable or transfer fails.
+        SCP audio to Pepper, play via ALAudioPlayer, clean up — all using a
+        single SSH connection (previously opened a second connection just for rm).
         """
         if not _PARAMIKO_AVAILABLE:
             print("⚠️  paramiko unavailable — cannot transfer audio to robot")
@@ -172,8 +195,9 @@ class PepperRobot:
             return False
 
         remote_path = f"/tmp/{os.path.basename(file_path)}"
+        ssh = None
         try:
-            # ── 1. SCP file to robot ──────────────────────────────────
+            # ── 1. Connect once, upload via SFTP ─────────────────────
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             ssh.connect(
@@ -185,7 +209,6 @@ class PepperRobot:
             sftp = ssh.open_sftp()
             sftp.put(file_path, remote_path)
             sftp.close()
-            ssh.close()
 
             # ── 2. Play via ALAudioPlayer ─────────────────────────────
             player  = self.session.service("ALAudioPlayer")
@@ -199,19 +222,14 @@ class PepperRobot:
             )
             anim.start()
 
-            player.play(file_id)      # Blocks until done
+            player.play(file_id)      # Blocks until playback done
             self._is_speaking_hq = False
 
-            # ── 3. Clean up remote file ───────────────────────────────
+            # ── 3. Clean up — reuse the same SSH connection ───────────
             try:
-                ssh2 = paramiko.SSHClient()
-                ssh2.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                ssh2.connect(self.ip, username=self.ssh_user,
-                             password=self.ssh_password, timeout=3)
-                ssh2.exec_command(f"rm -f {remote_path}")
-                ssh2.close()
+                ssh.exec_command(f"rm -f {remote_path}")
             except Exception:
-                pass  # Non-critical cleanup — ignore failures
+                pass  # Non-critical — ignore
 
             return True
 
@@ -220,22 +238,33 @@ class PepperRobot:
             print(f"⚠️  ALAudioPlayer failed: {e}")
             return False
         finally:
+            # Always close the single SSH connection and release speech lock
+            if ssh:
+                try:
+                    ssh.close()
+                except Exception:
+                    pass
             self._speech_lock.release()
 
     def _hq_speech_animation_loop(self):
-        """Background gestures + LED pulse while HQ audio is playing."""
+        """
+        Background gestures + LED pulse while HQ audio is playing.
+
+        Calls PUBLIC gesture methods (not _impl directly) so the gesture lock
+        is always respected — user-triggered gestures and this loop can't
+        fight over joint positions.
+        """
         gesture_fns = [
-            self._nod_impl,
-            self._explaining_gesture_impl,
-            self._thinking_gesture_impl,
-            self._look_around_impl,
+            self.nod,
+            self.explaining_gesture,
+            self.thinking_gesture,
+            self.look_around,
         ]
         while self._is_speaking_hq:
             try:
                 self.set_eye_color("blue")
                 if random.random() > 0.6:
                     random.choice(gesture_fns)()
-                # Sleep in small increments so we stay responsive to the flag
                 for _ in range(20):
                     if not self._is_speaking_hq:
                         break
@@ -246,14 +275,10 @@ class PepperRobot:
         self.set_eye_color("blue")
 
     # ------------------------------------------------------------------
-    # Thinking indicator — actual pulsing LED
+    # Thinking indicator
     # ------------------------------------------------------------------
 
     def thinking_indicator(self, start: bool = True):
-        """
-        start=True  → begin a background LED-pulse loop
-        start=False → stop the loop and restore steady blue
-        """
         if start:
             self._thinking = True
             if self._thinking_thread is None or not self._thinking_thread.is_alive():
@@ -265,7 +290,6 @@ class PepperRobot:
                 self._thinking_thread.start()
         else:
             self._thinking = False
-            # Thread will exit on its own; restore eyes immediately
             self.set_eye_color("blue")
 
     def _pulse_thinking_loop(self):
@@ -275,7 +299,6 @@ class PepperRobot:
             try:
                 self.set_eye_color(colours[idx % 2])
                 idx += 1
-                # 0.4s per blink phase
                 for _ in range(4):
                     if not self._thinking:
                         break
@@ -284,51 +307,42 @@ class PepperRobot:
                 break
 
     # ------------------------------------------------------------------
-    # Gesture dispatcher — all public gesture methods are non-blocking
+    # Gesture dispatcher
     # ------------------------------------------------------------------
 
     def _run_gesture(self, impl_fn, *args, **kwargs):
-        """
-        Fire-and-forget gesture execution.
-
-        The gesture lock is acquired atomically inside the worker thread.
-        If it can't be acquired (another gesture running), the request is
-        silently dropped — no queueing, no blocking, no TOCTOU race.
-        """
         def _worker():
             if not self._gesture_lock.acquire(blocking=False):
-                return   # Another gesture is running — skip this one
+                return
             try:
                 impl_fn(*args, **kwargs)
             finally:
                 self._gesture_lock.release()
-
         threading.Thread(target=_worker, daemon=True, name="Gesture").start()
 
-    # Public gesture API — all delegate to _run_gesture
-    def wave(self):             self._run_gesture(self._wave_impl)
-    def nod(self):              self._run_gesture(self._nod_impl)
-    def shake_head(self):       self._run_gesture(self._shake_head_impl)
-    def look_at_sound(self):    self._run_gesture(self._look_at_sound_impl)
-    def thinking_gesture(self): self._run_gesture(self._thinking_gesture_impl)
+    def wave(self):               self._run_gesture(self._wave_impl)
+    def nod(self):                self._run_gesture(self._nod_impl)
+    def shake_head(self):         self._run_gesture(self._shake_head_impl)
+    def look_at_sound(self):      self._run_gesture(self._look_at_sound_impl)
+    def thinking_gesture(self):   self._run_gesture(self._thinking_gesture_impl)
     def explaining_gesture(self): self._run_gesture(self._explaining_gesture_impl)
-    def excited_gesture(self):  self._run_gesture(self._excited_gesture_impl)
-    def point_forward(self):    self._run_gesture(self._point_forward_impl)
-    def shrug(self):            self._run_gesture(self._shrug_impl)
-    def celebrate(self):        self._run_gesture(self._celebrate_impl)
-    def look_around(self):      self._run_gesture(self._look_around_impl)
-    def bow(self):              self._run_gesture(self._bow_impl)
+    def excited_gesture(self):    self._run_gesture(self._excited_gesture_impl)
+    def point_forward(self):      self._run_gesture(self._point_forward_impl)
+    def shrug(self):              self._run_gesture(self._shrug_impl)
+    def celebrate(self):          self._run_gesture(self._celebrate_impl)
+    def look_around(self):        self._run_gesture(self._look_around_impl)
+    def bow(self):                self._run_gesture(self._bow_impl)
 
     # ------------------------------------------------------------------
-    # Gesture implementations (blocking — always run inside _run_gesture)
+    # Gesture implementations
     # ------------------------------------------------------------------
 
     def _wave_impl(self):
         try:
-            names   = ["RShoulderPitch", "RShoulderRoll", "RElbowRoll", "RElbowYaw"]
-            up      = [-0.5, -0.3, 1.5, 1.2]
-            down    = [-0.5, -0.3, 1.0, 1.2]
-            rest    = [ 1.5,  0.15, 0.5, 1.2]
+            names = ["RShoulderPitch", "RShoulderRoll", "RElbowRoll", "RElbowYaw"]
+            up    = [-0.5, -0.3, 1.5, 1.2]
+            down  = [-0.5, -0.3, 1.0, 1.2]
+            rest  = [ 1.5,  0.15, 0.5, 1.2]
             self.motion.setAngles(names, up, 0.2);   time.sleep(0.3)
             for _ in range(2):
                 self.motion.setAngles(names, down, 0.3); time.sleep(0.2)
@@ -362,9 +376,9 @@ class PepperRobot:
 
     def _thinking_gesture_impl(self):
         try:
-            names  = ["RShoulderPitch", "RShoulderRoll", "RElbowRoll", "RElbowYaw", "RWristYaw"]
-            pose   = [-0.3, -0.3, 1.2, 1.0, 0.0]
-            rest   = [ 1.5,  0.15, 0.5, 1.2, 0.0]
+            names = ["RShoulderPitch", "RShoulderRoll", "RElbowRoll", "RElbowYaw", "RWristYaw"]
+            pose  = [-0.3, -0.3, 1.2, 1.0, 0.0]
+            rest  = [ 1.5,  0.15, 0.5, 1.2, 0.0]
             self.motion.setAngles(names, pose, 0.15); time.sleep(1.0)
             self.motion.setAngles(names, rest, 0.15)
         except Exception as e:
@@ -446,17 +460,15 @@ class PepperRobot:
             print(f"❌ Bow error: {e}")
 
     # ------------------------------------------------------------------
-    # Movement (called at 10 Hz from movement_controller thread)
+    # Movement
     # ------------------------------------------------------------------
 
-    def move_forward(self,  speed: float = 0.5):
-        print(f"[DBG] move_forward speed={speed}")
-        self._move(speed,    0,  0)
-    def move_backward(self, speed: float = 0.5): self._move(-speed,   0,  0)
-    def turn_left(self,     speed: float = 0.5): self._move(0,        0,  speed)
-    def turn_right(self,    speed: float = 0.5): self._move(0,        0, -speed)
-    def strafe_left(self,   speed: float = 0.3): self._move(0,  speed,  0)
-    def strafe_right(self,  speed: float = 0.3): self._move(0, -speed,  0)
+    def move_forward(self,  speed: float = 0.5): self._move( speed,  0,  0)
+    def move_backward(self, speed: float = 0.5): self._move(-speed,  0,  0)
+    def turn_left(self,     speed: float = 0.5): self._move( 0,      0,  speed)
+    def turn_right(self,    speed: float = 0.5): self._move( 0,      0, -speed)
+    def strafe_left(self,   speed: float = 0.3): self._move( 0,  speed,  0)
+    def strafe_right(self,  speed: float = 0.3): self._move( 0, -speed,  0)
 
     def stop_movement(self):
         try:

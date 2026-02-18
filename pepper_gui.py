@@ -1,12 +1,17 @@
 """
 DearPyGUI Interface for Pepper AI Chat
 
-Changes from original:
-- Chat window now enforces a MAX_CHAT_MESSAGES limit.  When the cap is
-  exceeded the oldest message widget group is deleted so the window never
-  accumulates hundreds of widgets and slows DearPyGUI down.
-- Each message group gets a unique integer tag so it can be individually
-  deleted without rebuilding the whole chat area.
+Changes from previous version:
+- Keyboard gate is now event-driven instead of per-frame polled.
+  DPG item_activated_handler / item_deactivated_handler on the input box
+  flip text_input_focused exactly when the cursor appears/disappears.
+  No more dpg.is_item_focused() in the render loop — zero lag, zero race.
+- Status queue is now latest-wins: the entire queue is drained each frame
+  but only the last item is applied, so rapid status updates don't flash
+  invisibly and then disappear.
+- Scroll-to-bottom is deferred by one frame via a pending flag so DPG has
+  time to recalculate scroll_max before we try to jump to it.
+- MAX_CHAT_MESSAGES cap and per-group widget tags are unchanged.
 """
 
 import queue
@@ -16,32 +21,30 @@ import time
 import dearpygui.dearpygui as dpg
 
 
-MAX_CHAT_MESSAGES = 60   # Keep the last N message groups in the chat window
+MAX_CHAT_MESSAGES = 60
 
 
 class PepperDearPyGUI:
     def __init__(self, message_callback):
-        """
-        Args:
-            message_callback: Called with the message string whenever the
-                              user sends text or voice input.
-        """
         self.message_callback   = message_callback
         self.is_running         = False
         self.message_queue      = queue.Queue()
         self.status_queue       = queue.Queue()
+
+        # Written only from DPG callbacks (main thread) — read from pynput thread.
+        # No lock needed: bool assignment is atomic in CPython, and the flag is
+        # only set by two well-defined DPG events.
         self.text_input_focused = False
 
-        # Track widget tags for the rolling message limit
-        self._msg_tag_counter = 0
-        self._msg_tags: list  = []    # list of group tags in insertion order
+        self._msg_tag_counter      = 0
+        self._msg_tags: list       = []
+        self._scroll_pending: bool = False   # Deferred scroll-to-bottom flag
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def start(self):
-        """Start GUI — blocks until the window is closed."""
         self.is_running = True
         dpg.create_context()
         self._setup_window()
@@ -77,7 +80,6 @@ class PepperDearPyGUI:
         with dpg.window(label="Pepper AI Chat", tag="main_window",
                         no_close=True, no_collapse=True):
 
-            # Header
             with dpg.group(horizontal=True):
                 dpg.add_text("🤖 Pepper AI Dashboard",
                              tag="header_text", color=(100, 149, 237))
@@ -87,36 +89,32 @@ class PepperDearPyGUI:
 
             dpg.add_separator()
 
-            # Recording indicator (hidden by default)
             with dpg.group(tag="recording_indicator", show=False):
                 dpg.add_text("🔴  RECORDING — Release R to send",
                              tag="recording_label", color=(255, 80, 80))
                 dpg.add_separator()
 
-            # Controls summary
             with dpg.collapsing_header(label="💡 Controls & Instructions",
                                        default_open=True):
-                dpg.add_text("Text mode:  type below → Enter / Send")
+                dpg.add_text("Text mode:  click the input box → type → Enter / Send")
+                dpg.add_text("           (click outside or send to return to robot controls)")
                 dpg.add_text("Voice mode: hold R → speak → release R")
                 dpg.add_spacer(height=4)
-                dpg.add_text("Terminal controls:")
-                dpg.add_text("  SPACE=Wake/Sleep  |  WASD=Move  |  1-9=Gestures")
-                dpg.add_text("  5-7=LED colour    |  X=Quit")
+                dpg.add_text("Robot controls (when input box is NOT focused):")
+                dpg.add_text("  SPACE=Wake/Sleep  |  WASD=Move  |  1-9=Gestures  |  5-7=LED")
 
             dpg.add_separator()
 
-            # Chat area
             dpg.add_text("Chat History:", color=(200, 200, 200))
             dpg.add_child_window(tag="chat_window", height=350, border=True)
 
             dpg.add_separator()
 
-            # Text input
             dpg.add_text("Your Message:", color=(200, 200, 200))
             with dpg.group(horizontal=True):
                 dpg.add_input_text(
                     tag      = "message_input",
-                    hint     = "Type here… or hold R in terminal to speak",
+                    hint     = "Click here to type… or hold R to speak",
                     width    = -100,
                     on_enter = True,
                     callback = self._send_text_message,
@@ -124,9 +122,16 @@ class PepperDearPyGUI:
                 dpg.add_button(label="Send", width=90,
                                callback=self._send_text_message)
 
+            # ── Cursor-based keyboard gate ────────────────────────────
+            # activated   → cursor appears  → suppress robot commands
+            # deactivated → cursor disappears → restore robot commands
+            with dpg.item_handler_registry(tag="input_focus_handler"):
+                dpg.add_item_activated_handler(callback=self._on_input_activated)
+                dpg.add_item_deactivated_handler(callback=self._on_input_deactivated)
+            dpg.bind_item_handler_registry("message_input", "input_focus_handler")
+
             dpg.add_separator()
 
-            # Footer
             with dpg.group(horizontal=True):
                 dpg.add_text("Terminal:", color=(150, 150, 150))
                 dpg.add_text(" SPACE=Wake", color=(100, 200, 100))
@@ -137,11 +142,23 @@ class PepperDearPyGUI:
         dpg.set_primary_window("main_window", True)
 
         self._add_system_message("🤖 Pepper AI Control Dashboard started")
-        self._add_system_message("Type below, or hold R in the terminal to speak")
-        self._add_system_message("Press SPACE in terminal to wake Pepper")
+        self._add_system_message("Click the input box below to type, or hold R to speak")
+        self._add_system_message("Press SPACE (outside input box) to wake Pepper")
 
     # ------------------------------------------------------------------
-    # Callbacks
+    # Keyboard gate callbacks — only ever called from DPG main thread
+    # ------------------------------------------------------------------
+
+    def _on_input_activated(self):
+        """Cursor appeared in the text box — block all robot key commands."""
+        self.text_input_focused = True
+
+    def _on_input_deactivated(self):
+        """Cursor left the text box — restore robot key commands."""
+        self.text_input_focused = False
+
+    # ------------------------------------------------------------------
+    # Send callback
     # ------------------------------------------------------------------
 
     def _send_text_message(self, sender=None, app_data=None):
@@ -149,13 +166,15 @@ class PepperDearPyGUI:
         if not message:
             return
         dpg.set_value("message_input", "")
+        # Unfocus the input box so robot controls are immediately restored
+        dpg.focus_item("main_window")
         self._add_user_message(message, voice=False)
         threading.Thread(
             target=self.message_callback, args=(message,), daemon=True
         ).start()
 
     # ------------------------------------------------------------------
-    # Thread-safe public methods (queue writes — safe from any thread)
+    # Thread-safe public methods
     # ------------------------------------------------------------------
 
     def add_pepper_message(self, message: str):
@@ -174,26 +193,24 @@ class PepperDearPyGUI:
         self.message_queue.put(("recording_state", recording))
 
     # ------------------------------------------------------------------
-    # Main-thread renderers (called only from _process_queues)
+    # Main-thread renderers
     # ------------------------------------------------------------------
 
     def _next_tag(self) -> int:
-        """Return a unique integer tag for a new message group."""
         self._msg_tag_counter += 1
         return self._msg_tag_counter
 
     def _register_message_tag(self, tag: int):
-        """
-        Track this tag for the rolling limit.
-        If over MAX_CHAT_MESSAGES, delete the oldest group widget.
-        """
         self._msg_tags.append(tag)
         if len(self._msg_tags) > MAX_CHAT_MESSAGES:
             old_tag = self._msg_tags.pop(0)
             try:
                 dpg.delete_item(old_tag)
             except Exception:
-                pass   # Already gone somehow; that's fine
+                pass
+        # Schedule scroll rather than calling it immediately — DPG needs one
+        # more frame to recalculate scroll_max after adding the new widget.
+        self._scroll_pending = True
 
     def _add_user_message(self, message: str, voice: bool = False):
         tag    = self._next_tag()
@@ -204,7 +221,6 @@ class PepperDearPyGUI:
                 dpg.add_text(prefix, color=color)
                 dpg.add_text(message, wrap=620)
         self._register_message_tag(tag)
-        dpg.set_y_scroll("chat_window", dpg.get_y_scroll_max("chat_window"))
 
     def _add_pepper_message_internal(self, message: str):
         tag = self._next_tag()
@@ -213,14 +229,12 @@ class PepperDearPyGUI:
                 dpg.add_text("Pepper:", color=(76, 175, 80))
                 dpg.add_text(message, wrap=620)
         self._register_message_tag(tag)
-        dpg.set_y_scroll("chat_window", dpg.get_y_scroll_max("chat_window"))
 
     def _add_system_message(self, message: str):
         tag = self._next_tag()
         with dpg.group(tag=tag, parent="chat_window"):
             dpg.add_text(f"• {message}", color=(150, 150, 150))
         self._register_message_tag(tag)
-        dpg.set_y_scroll("chat_window", dpg.get_y_scroll_max("chat_window"))
 
     def _set_recording_internal(self, recording: bool):
         dpg.configure_item("recording_indicator", show=recording)
@@ -232,12 +246,12 @@ class PepperDearPyGUI:
     # ------------------------------------------------------------------
 
     def _process_queues(self):
-        # Track text-input focus for PTT guard in main.py
-        try:
-            self.text_input_focused = dpg.is_item_focused("message_input")
-        except Exception:
-            self.text_input_focused = False
+        # Deferred scroll — applied one frame after the widget was added
+        if self._scroll_pending:
+            dpg.set_y_scroll("chat_window", dpg.get_y_scroll_max("chat_window"))
+            self._scroll_pending = False
 
+        # Message queue — process all pending items
         while not self.message_queue.empty():
             try:
                 kind, data = self.message_queue.get_nowait()
@@ -255,12 +269,18 @@ class PepperDearPyGUI:
             except queue.Empty:
                 break
 
+        # Status queue — latest-wins: drain all, apply only the last one
+        last_status = None
         while not self.status_queue.empty():
             try:
-                status = self.status_queue.get_nowait()
-                dpg.set_value("status_text", f"Status: {status}")
+                last_status = self.status_queue.get_nowait()
             except queue.Empty:
                 break
+        if last_status is not None:
+            try:
+                dpg.set_value("status_text", f"Status: {last_status}")
+            except Exception:
+                pass  # DPG context may already be destroyed on shutdown
 
 
 # ---------------------------------------------------------------------------
