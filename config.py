@@ -13,7 +13,7 @@ GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", None)
 
 # ===== PEPPER ROBOT SETTINGS =====
-PEPPER_IP       = os.getenv("PEPPER_IP", "10.51.200.219")
+PEPPER_IP       = os.getenv("PEPPER_IP", "10.55.203.146")
 PEPPER_PORT     = 9559
 PEPPER_SSH_USER = os.getenv("PEPPER_SSH_USER", "nao")
 PEPPER_SSH_PASS = os.getenv("PEPPER_SSH_PASS", "nao")

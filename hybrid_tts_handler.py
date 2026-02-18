@@ -1,16 +1,12 @@
 """
 Hybrid TTS Handler — 3-Tier System
-  Tier 1: Groq TTS (Orpheus)   — fastest
-  Tier 2: ElevenLabs           — highest quality (optional)
-  Tier 3: Edge TTS             — unlimited, always available
+  Tier 1: Groq TTS (Orpheus)   — fastest, primary
+  Tier 2: Edge TTS             — unlimited, always available
+  Tier 3: ElevenLabs           — rate-limited, last resort
 
-Changes from original:
-- ElevenLabs updated to current SDK (v1+) using ElevenLabs client object.
-  Old `from elevenlabs import generate, set_api_key, save` is no longer valid.
-- asyncio: replaced asyncio.run() with explicit new_event_loop() + close() to
-  avoid "event loop already running" errors when called from threaded contexts.
-- Rate-limit handling: on any 429/rate-limit, fall through to next tier
-  immediately (no blocking waits that freeze the robot).
+Tier order: Edge promoted to Tier 2 because it's unlimited and reliable.
+ElevenLabs demoted to Tier 3 — still available as a quality fallback but
+won't block if quota is hit.
 """
 
 import asyncio
@@ -23,9 +19,6 @@ import edge_tts
 from groq import Groq
 
 
-# ---------------------------------------------------------------------------
-# ElevenLabs — optional, gracefully degraded if not installed / not keyed
-# ---------------------------------------------------------------------------
 try:
     from elevenlabs import ElevenLabs as _ElevenLabsClient
     _ELEVENLABS_IMPORTABLE = True
@@ -41,7 +34,7 @@ class HybridTTSHandler:
         groq_voice:          str = "hannah",
         groq_model:          str = "canopylabs/orpheus-v1-english",
         elevenlabs_api_key:  Optional[str] = None,
-        elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM",   # ElevenLabs voice ID (Rachel)
+        elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM",
         edge_voice:          str = "en-US-AriaNeural",
         edge_rate:           str = "+0%",
     ):
@@ -50,7 +43,11 @@ class HybridTTSHandler:
         self.groq_voice  = groq_voice
         self.groq_model  = groq_model
 
-        # ── Tier 2: ElevenLabs ────────────────────────────────────────
+        # ── Tier 2: Edge TTS ──────────────────────────────────────────
+        self.edge_voice = edge_voice
+        self.edge_rate  = edge_rate
+
+        # ── Tier 3: ElevenLabs ────────────────────────────────────────
         self._el_client          = None
         self.elevenlabs_enabled  = False
         self.elevenlabs_voice_id = elevenlabs_voice_id
@@ -66,20 +63,15 @@ class HybridTTSHandler:
                 except Exception as e:
                     print(f"⚠️  ElevenLabs init failed: {e}")
 
-        # ── Tier 3: Edge TTS ──────────────────────────────────────────
-        self.edge_voice = edge_voice
-        self.edge_rate  = edge_rate
-
         # Daily-limit flags (reset on restart)
         self._groq_daily_limit_hit       = False
         self._elevenlabs_daily_limit_hit = False
 
-        # Status summary
         print("🔊 Hybrid TTS ready (3-tier):")
         print(f"   Tier 1: Groq Orpheus   ({groq_voice})")
+        print(f"   Tier 2: Edge TTS       ({edge_voice}) [unlimited]")
         el_status = f"({elevenlabs_voice_id})" if self.elevenlabs_enabled else "(disabled)"
-        print(f"   Tier 2: ElevenLabs     {el_status}")
-        print(f"   Tier 3: Edge TTS       ({edge_voice}) [unlimited]")
+        print(f"   Tier 3: ElevenLabs     {el_status}")
 
     # ------------------------------------------------------------------
     # Public API
@@ -92,30 +84,28 @@ class HybridTTSHandler:
         emotion:     Optional[str] = None,
     ) -> Optional[str]:
         """
-        Generate speech via Groq → ElevenLabs → Edge TTS fallback chain.
-
-        Returns:
-            Path to the generated audio file, or None on total failure.
+        Generate speech via Groq → Edge TTS → ElevenLabs fallback chain.
+        Returns path to the generated audio file, or None on total failure.
         """
         if output_file is None:
             fd, output_file = tempfile.mkstemp(suffix=".wav")
             os.close(fd)
 
-        # Tier 1 — Groq
+        # Tier 1 — Groq Orpheus
         if not self._groq_daily_limit_hit:
             if self._speak_groq(text, output_file, emotion):
                 return output_file
 
-        # Tier 2 — ElevenLabs
-        if self.elevenlabs_enabled and not self._elevenlabs_daily_limit_hit:
-            el_file = output_file.replace(".wav", ".mp3")
-            if self._speak_elevenlabs(text, el_file):
-                return el_file
-
-        # Tier 3 — Edge TTS (unlimited)
+        # Tier 2 — Edge TTS (unlimited, always available)
         edge_file = output_file.replace(".wav", ".mp3")
         if self._speak_edge(text, edge_file):
             return edge_file
+
+        # Tier 3 — ElevenLabs (last resort)
+        if self.elevenlabs_enabled and not self._elevenlabs_daily_limit_hit:
+            el_file = output_file.replace(".wav", "_el.mp3")
+            if self._speak_elevenlabs(text, el_file):
+                return el_file
 
         return None
 
@@ -142,7 +132,7 @@ class HybridTTSHandler:
         print("⚠️  No audio player found (install aplay, mpg123, or ffplay)")
 
     def speak_and_play(self, text: str, emotion: Optional[str] = None) -> bool:
-        """Generate speech and play it locally (for testing without Pepper)."""
+        """Generate speech and play it locally (offline mode / testing)."""
         path = self.speak(text, emotion=emotion)
         if not path:
             return False
@@ -173,9 +163,6 @@ class HybridTTSHandler:
                 input=input_text,
                 response_format="wav",
             )
-            # The Groq audio API returns a BinaryAPIResponse — use
-            # stream_to_file() or read() depending on SDK version.
-            # stream_to_file() is the official method; fall back to read().
             try:
                 resp.stream_to_file(output_file)
             except AttributeError:
@@ -185,37 +172,33 @@ class HybridTTSHandler:
             return True
         except Exception as e:
             err = str(e).lower()
-            if "429" in err or "rate limit" in err:
-                print("⏳ Groq rate-limited → falling to Tier 2")
+            if "429" in err or "rate limit" in err or "daily" in err:
+                print("⏳ Groq TTS rate-limited → falling to Tier 2 (Edge)")
+                self._groq_daily_limit_hit = True
             else:
                 print(f"⚠️  Groq TTS error: {e}")
             return False
 
     def _speak_elevenlabs(self, text: str, output_file: str) -> bool:
-        """
-        ElevenLabs Tier 2 using the current SDK (v1+).
-        Uses eleven_turbo_v2_5 — the current free-tier supported model.
-        The deprecated eleven_monolingual_v1 has been removed from free tier.
-        """
         if not self.elevenlabs_enabled or self._elevenlabs_daily_limit_hit:
             return False
         try:
             audio_iter = self._el_client.text_to_speech.convert(
                 voice_id=self.elevenlabs_voice_id,
                 text=text,
-                model_id="eleven_turbo_v2_5",   # Free-tier compatible
+                model_id="eleven_turbo_v2_5",
                 output_format="mp3_44100_128",
             )
             with open(output_file, "wb") as f:
                 for chunk in audio_iter:
                     if chunk:
                         f.write(chunk)
-            print("🎤 Tier 2: ElevenLabs TTS")
+            print("🎤 Tier 3: ElevenLabs TTS")
             return True
         except Exception as e:
             err = str(e).lower()
-            if "quota" in err or "limit" in err or "429" in err or "subscription" in err or "deprecated" in err:
-                print("⚠️  ElevenLabs limit/auth → Tier 3")
+            if "quota" in err or "limit" in err or "429" in err or "subscription" in err:
+                print("⚠️  ElevenLabs limit/auth → marking as exhausted")
                 self._elevenlabs_daily_limit_hit = True
             else:
                 print(f"⚠️  ElevenLabs error: {e}")
@@ -225,19 +208,13 @@ class HybridTTSHandler:
         try:
             comm = edge_tts.Communicate(text, self.edge_voice, rate=self.edge_rate)
             await comm.save(output_file)
-            print("🎤 Tier 3: Edge TTS")
+            print("🎤 Tier 2: Edge TTS")
             return True
         except Exception as e:
             print(f"❌ Edge TTS error: {e}")
             return False
 
     def _speak_edge(self, text: str, output_file: str) -> bool:
-        """
-        Synchronous wrapper for Edge TTS.
-
-        Uses an explicit new event loop instead of asyncio.run() to avoid
-        "event loop already running" errors in threaded contexts.
-        """
         loop = asyncio.new_event_loop()
         try:
             asyncio.set_event_loop(loop)

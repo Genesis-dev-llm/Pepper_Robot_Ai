@@ -349,51 +349,55 @@ def on_release(key):
 
 def movement_controller():
     """
-    Sends NAOqi move commands only when the active-key state CHANGES.
+    Sends moveToward() continuously at 10 Hz while any key is held.
 
-    Watchdog fires after WATCHDOG_TIMEOUT seconds of no key activity while
-    movement keys appear pressed — catches dropped key-up events.
-    Timeout is 2s (raised from 1s) to avoid falsely stopping on systems
-    where OS key-repeat is slow or disabled.
+    Why continuous instead of fire-once-on-change:
+    - NAOqi has an internal watchdog that stops movement if it doesn't receive
+      a new velocity command within ~1s.
+    - moveToward() is designed to be called repeatedly with the desired velocity.
+    - This matches how all standard NAOqi teleoperation code works.
+
+    Watchdog: if keys appear held but no keypress event in 2s (dropped
+    key-up), force-clear and stop.
     """
     WATCHDOG_TIMEOUT = 2.0
-    prev_state       = None
+    SEND_INTERVAL    = 0.1   # 10 Hz
 
     while state.running:
         try:
-            if not _pepper_ok():
-                time.sleep(0.1)
+            if not _pepper_ok() or not state.robot_active:
+                time.sleep(SEND_INTERVAL)
                 continue
 
             any_pressed = any(movement_keys.values())
 
-            # Watchdog: force-stop if keys look held but no event in 2s
+            # Watchdog — dropped key-up guard
             if any_pressed and (time.time() - state.last_movement_key_time > WATCHDOG_TIMEOUT):
                 for k in movement_keys:
                     movement_keys[k] = False
                 pepper.stop_movement()
-                prev_state = None
-                time.sleep(0.1)
+                time.sleep(SEND_INTERVAL)
                 continue
 
-            current = (
-                movement_keys['w'], movement_keys['s'],
-                movement_keys['a'], movement_keys['d'],
-                movement_keys['q'], movement_keys['e'],
-            )
+            w = movement_keys['w']
+            s = movement_keys['s']
+            a = movement_keys['a']
+            d = movement_keys['d']
+            q = movement_keys['q']
+            e = movement_keys['e']
 
-            if current != prev_state:
-                w, s, a, d, q, e = current
-                if   w: pepper.move_forward()
-                elif s: pepper.move_backward()
-                elif a: pepper.turn_left()
-                elif d: pepper.turn_right()
-                elif q: pepper.strafe_left()
-                elif e: pepper.strafe_right()
-                else:   pepper.stop_movement()
-                prev_state = current
+            if   w: pepper.move_forward()
+            elif s: pepper.move_backward()
+            elif a: pepper.turn_left()
+            elif d: pepper.turn_right()
+            elif q: pepper.strafe_left()
+            elif e: pepper.strafe_right()
+            # Only send stop once when we transition from moving to not moving
+            elif any_pressed is False and getattr(movement_controller, '_was_moving', False):
+                pepper.stop_movement()
 
-            time.sleep(0.05)
+            movement_controller._was_moving = any_pressed
+            time.sleep(SEND_INTERVAL)
 
         except Exception as ex:
             print(f"❌ Movement controller error: {ex}")
