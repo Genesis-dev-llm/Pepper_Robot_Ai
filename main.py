@@ -27,6 +27,7 @@ tts          = None
 web_searcher = None
 voice        = None          # VoiceHandler instance
 ptt_active   = False         # Is push-to-talk key currently held?
+last_movement_key_time = 0.0 # Watchdog: last time a movement key was seen
 
 # Movement keys — held-state dict
 movement_keys = {
@@ -68,6 +69,8 @@ def on_press(key):
         # ── Movement ─────────────────────────────────────────────────────
         if k in movement_keys:
             movement_keys[k] = True
+            global last_movement_key_time
+            last_movement_key_time = time.time()
 
         # ── Gestures ─────────────────────────────────────────────────────
         elif k == '1':
@@ -136,12 +139,25 @@ def on_release(key):
 
 
 def movement_controller():
-    """Continuously check movement keys and move robot"""
-    global running, pepper, movement_keys
-    
+    """Continuously check movement keys and move robot.
+    Includes a 1-second watchdog: if no key event arrives within that window
+    the robot is forced to stop (protects against dropped key-release events)."""
+    global running, pepper, movement_keys, last_movement_key_time
+    WATCHDOG_TIMEOUT = 1.0  # seconds
+
     while running:
         try:
-            # Check if any movement key is pressed
+            any_pressed = any(movement_keys.values())
+
+            # Watchdog: force-stop if keys appear held but no event in 1s
+            if any_pressed and (time.time() - last_movement_key_time > WATCHDOG_TIMEOUT):
+                for k in movement_keys:
+                    movement_keys[k] = False
+                pepper.stop_movement()
+                time.sleep(0.1)
+                continue
+
+            # Normal movement dispatch
             if movement_keys['w']:
                 pepper.move_forward()
             elif movement_keys['s']:
@@ -155,9 +171,8 @@ def movement_controller():
             elif movement_keys['e']:
                 pepper.strafe_right()
             else:
-                # No keys pressed, stop
                 pepper.stop_movement()
-            
+
             time.sleep(0.1)  # 10Hz update rate
         except Exception as e:
             print(f"❌ Movement controller error: {e}")
@@ -223,6 +238,28 @@ def execute_function_calls(function_calls: list):
     return search_results
 
 
+def _speak_hq(text: str):
+    """
+    Speak using HQ TTS → Pepper speakers pipeline.
+    Falls back to Pepper's built-in voice if the HQ pipeline fails.
+    """
+    try:
+        audio_path = tts.speak(text)
+        if audio_path and pepper.play_audio_file(audio_path):
+            # Clean up temp file
+            try:
+                import os
+                os.remove(audio_path)
+            except Exception:
+                pass
+            return
+    except Exception as e:
+        print(f"⚠️ HQ TTS pipeline failed: {e}")
+
+    # Fallback: use Pepper's built-in TTS
+    pepper.speak(text)
+
+
 def handle_gui_message(message: str):
     """
     Handle message from GUI
@@ -250,7 +287,7 @@ def handle_gui_message(message: str):
             pepper.set_eye_color("white")
             gui.add_pepper_message(response)
             gui.update_status("Pepper is idle")
-            pepper.speak(response)
+            _speak_hq(response)
             return
         
         # Process with AI
@@ -279,7 +316,7 @@ def handle_gui_message(message: str):
         # Speak and display response
         if response_text:
             gui.add_pepper_message(response_text)
-            pepper.speak(response_text)
+            _speak_hq(response_text)
             gui.update_status("Ready")
         else:
             gui.add_pepper_message("Sorry, I didn't understand that.")
@@ -372,6 +409,14 @@ def main():
 
     # 6. Voice Handler ─────────────────────────────────────────────────
     print("\n6️⃣  Initialising voice (STT)…")
+    if config.VOICE_ENABLED:
+        try:
+            VoiceHandler.validate_setup()
+        except RuntimeError as e:
+            print(f"   ❌ Voice pre-check failed: {e}")
+            print("   ⚠️  Voice disabled due to missing dependencies")
+            config.VOICE_ENABLED = False
+
     if config.VOICE_ENABLED:
         list_microphones()
 

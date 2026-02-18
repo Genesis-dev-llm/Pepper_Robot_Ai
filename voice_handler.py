@@ -17,6 +17,34 @@ from typing import Optional, Callable
 
 
 class VoiceHandler:
+
+    @staticmethod
+    def validate_setup() -> bool:
+        """
+        Check that the audio back-end (PortAudio) is available.
+
+        Returns True if everything looks good.
+        Raises RuntimeError with a human-friendly fix message otherwise.
+        """
+        try:
+            devices = sd.query_devices()
+            input_devs = [d for d in devices if d["max_input_channels"] > 0]
+            if not input_devs:
+                raise RuntimeError(
+                    "No input devices found. "
+                    "Plug in a microphone or enable the built-in mic."
+                )
+            return True
+        except OSError as e:
+            if "PortAudio" in str(e):
+                raise RuntimeError(
+                    "PortAudio library not found!\n"
+                    "  Fix on Ubuntu/Debian:  sudo apt-get install libportaudio2\n"
+                    "  Fix on macOS:          brew install portaudio\n"
+                    "  Fix on Windows:        pip install sounddevice  (ships PortAudio)"
+                ) from e
+            raise
+
     def __init__(
         self,
         transcribe_fn: Callable[[str], Optional[str]],

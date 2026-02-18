@@ -5,6 +5,7 @@ Handles all communication and control with Pepper via qi library
 
 import qi
 import time
+import threading
 from typing import Optional
 
 class PepperRobot:
@@ -19,6 +20,7 @@ class PepperRobot:
         self.audio = None
         self.leds = None
         self.awareness = None
+        self._speech_lock = threading.Lock()   # Prevent overlapping speech
         
     def connect(self) -> bool:
         """Establish connection to Pepper"""
@@ -58,15 +60,15 @@ class PepperRobot:
     # ===== SPEECH =====
     
     def speak(self, text: str, use_animation: bool = True):
-        """Make Pepper speak text"""
-        try:
-            if use_animation and self.animated_speech:
-                # Animated speech is more expressive
-                self.animated_speech.say(text)
-            else:
-                self.tts.say(text)
-        except Exception as e:
-            print(f"❌ Speech error: {e}")
+        """Make Pepper speak text (thread-safe — blocks if already speaking)."""
+        with self._speech_lock:
+            try:
+                if use_animation and self.animated_speech:
+                    self.animated_speech.say(text)
+                else:
+                    self.tts.say(text)
+            except Exception as e:
+                print(f"❌ Speech error: {e}")
     
     def set_volume(self, volume: int):
         """Set speech volume (0-100)"""
@@ -82,6 +84,27 @@ class PepperRobot:
         # This is handled differently - usually you'd use ALAudioRecorder
         # or subscribe to ALAudioDevice for streaming
         pass
+
+    def play_audio_file(self, file_path: str) -> bool:
+        """
+        Play a local audio file through Pepper's speakers via ALAudioPlayer.
+
+        Args:
+            file_path: Absolute path to a WAV or MP3 file accessible on the robot
+                       (or on the machine running this script if using a local qi session).
+
+        Returns:
+            True if playback succeeded, False otherwise.
+        """
+        with self._speech_lock:
+            try:
+                player = self.session.service("ALAudioPlayer")
+                file_id = player.loadFile(file_path)
+                player.play(file_id)
+                return True
+            except Exception as e:
+                print(f"⚠️ ALAudioPlayer failed ({e}), falling back to built-in TTS")
+                return False
     
     # ===== MOVEMENTS =====
     
