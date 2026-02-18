@@ -1,99 +1,98 @@
 """
-Web Search Handler using DuckDuckGo
-Free, unlimited searches with no API key required
+Web Search Handler — DuckDuckGo (free, no API key required)
+
+Changes from original:
+- All searches run inside a ThreadPoolExecutor with a configurable timeout.
+  DuckDuckGo calls can silently hang; this ensures the robot is never frozen
+  waiting for a network response.
 """
 
+import concurrent.futures
+from typing import Dict, List
+
 from duckduckgo_search import DDGS
-from typing import List, Dict
 
 
 class WebSearchHandler:
-    def __init__(self, max_results: int = 3):
+    def __init__(self, max_results: int = 3, timeout: float = 8.0):
         """
-        Initialize web search handler
-
         Args:
-            max_results: Maximum number of search results to return (default: 3)
+            max_results: Maximum results per query.
+            timeout:     Seconds before a hung search is abandoned.
         """
         self.max_results = max_results
-        # NOTE: DDGS is created fresh per search call (not stored as instance var)
-        # This avoids connection-timeout issues on long-running sessions.
+        self.timeout     = timeout
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def search(self, query: str) -> str:
         """
-        Search the web and return formatted results.
-
-        Args:
-            query: Search query string
-
-        Returns:
-            Formatted string with search results
+        Search and return a formatted string suitable for injecting into
+        the LLM context.  Never hangs — returns an error string on timeout.
         """
+        print(f"🔍 Web search: '{query}'")
         try:
-            print(f"🔍 Searching web for: '{query}'")
-
-            # Fresh DDGS instance per call — avoids stale connection issues
-            with DDGS() as ddgs:
-                raw = ddgs.text(query, max_results=self.max_results)
-
-            # Ensure we have a plain list (DDGS may return a generator)
-            results: List[Dict] = list(raw) if raw else []
-
-            if not results:
-                return f"No search results found for '{query}'"
-
-            # Format results
-            formatted = f"Web search results for '{query}':\n\n"
-            for i, result in enumerate(results, 1):
-                title = result.get('title', 'No title')
-                body  = result.get('body',  'No description')
-                url   = result.get('href',  '')
-
-                formatted += f"{i}. {title}\n"
-                formatted += f"   {body}\n"
-                if url:
-                    formatted += f"   Source: {url}\n"
-                formatted += "\n"
-
-            print(f"✅ Found {len(results)} results")
-            return formatted.strip()
-
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(self._do_search, query)
+                results = future.result(timeout=self.timeout)
+        except concurrent.futures.TimeoutError:
+            msg = f"Search timed out after {self.timeout}s for '{query}'"
+            print(f"⏱️ {msg}")
+            return msg
         except Exception as e:
-            error_msg = f"Search error: {str(e)}"
-            print(f"❌ {error_msg}")
-            return error_msg
+            msg = f"Search error: {e}"
+            print(f"❌ {msg}")
+            return msg
+
+        if not results:
+            return f"No results found for '{query}'"
+
+        lines = [f"Web search results for '{query}':\n"]
+        for i, r in enumerate(results, 1):
+            title = r.get("title", "No title")
+            body  = r.get("body",  "No description")
+            url   = r.get("href",  "")
+            lines.append(f"{i}. {title}")
+            lines.append(f"   {body}")
+            if url:
+                lines.append(f"   Source: {url}")
+            lines.append("")
+
+        print(f"✅ Got {len(results)} search result(s)")
+        return "\n".join(lines).strip()
 
     def search_structured(self, query: str) -> List[Dict]:
-        """
-        Search and return structured results (for programmatic use).
-
-        Args:
-            query: Search query string
-
-        Returns:
-            List of result dictionaries
-        """
+        """Return raw result dicts (for programmatic use)."""
         try:
-            with DDGS() as ddgs:
-                raw = ddgs.text(query, max_results=self.max_results)
-            return list(raw) if raw else []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(self._do_search, query)
+                return future.result(timeout=self.timeout)
         except Exception as e:
-            print(f"❌ Search error: {e}")
+            print(f"❌ Structured search error: {e}")
             return []
 
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
 
-# ── Standalone test ────────────────────────────────────────────────────────
+    def _do_search(self, query: str) -> List[Dict]:
+        """Blocking DuckDuckGo call — always run inside a thread with timeout."""
+        with DDGS() as ddgs:
+            raw = ddgs.text(query, max_results=self.max_results)
+            return list(raw) if raw else []
+
+
+# ---------------------------------------------------------------------------
+# Standalone test
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("Testing DuckDuckGo search...")
+    handler = WebSearchHandler(max_results=3, timeout=8.0)
 
-    search = WebSearchHandler(max_results=3)
+    print("=== Formatted search ===")
+    print(handler.search("latest AI news 2026"))
 
-    results = search.search("latest AI news 2026")
-    print(results)
-
-    print("\n" + "=" * 60 + "\n")
-
-    structured = search.search_structured("python programming")
-    print(f"Found {len(structured)} structured results:")
-    for r in structured:
-        print(f"- {r.get('title', 'No title')}")
+    print("\n=== Structured search ===")
+    for r in handler.search_structured("python programming"):
+        print(f"  - {r.get('title', 'N/A')}")

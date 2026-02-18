@@ -1,67 +1,75 @@
 """
 Configuration file for Pepper AI Project
-Store your API keys and robot settings here
-
-SECURITY NOTE:
-For better security, set environment variables instead of hardcoding:
-  export GROQ_API_KEY="your_key_here"
-  export PEPPER_IP="192.168.1.100"
 """
 
 import os
+from datetime import date
 from dotenv import load_dotenv
 
-# Load environment variables from .env file if it exists
 load_dotenv()
 
 # ===== API KEYS =====
-# Try environment variable first, fall back to hardcoded value
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")  # Get from https://console.groq.com/keys
-
-# OPTIONAL: ElevenLabs for higher quality TTS (free tier: 10k chars/month)
-# If not provided, system will skip ElevenLabs and fall back to Edge TTS
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", None)  # Get from https://elevenlabs.io
+GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", None)
 
 # ===== PEPPER ROBOT SETTINGS =====
-PEPPER_IP = os.getenv("PEPPER_IP", "192.168.1.100")  # Change this to your Pepper's IP address
-PEPPER_PORT = 9559
+PEPPER_IP       = os.getenv("PEPPER_IP", "10.51.200.219")
+PEPPER_PORT     = 9559
+# SSH credentials for file transfer (used by ALAudioPlayer HQ pipeline)
+# Pepper's default credentials are nao/nao — change if yours differ
+PEPPER_SSH_USER = os.getenv("PEPPER_SSH_USER", "nao")
+PEPPER_SSH_PASS = os.getenv("PEPPER_SSH_PASS", "nao")
 
 # ===== GROQ MODEL SETTINGS =====
-GROQ_LLM_MODEL = "llama-3.3-70b-versatile"  # Fast, supports gestures + custom search
-GROQ_COMPOUND_MODEL = "groq/compound"  # With built-in web search (no custom functions)
-USE_WEB_SEARCH = False  # False = use custom DuckDuckGo search function (better!)
-GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"  # Fast STT
+GROQ_LLM_MODEL      = "llama-3.3-70b-versatile"
+GROQ_COMPOUND_MODEL = "groq/compound"
+USE_WEB_SEARCH      = False
+GROQ_WHISPER_MODEL  = "whisper-large-v3-turbo"
 
 # ===== CONVERSATION SETTINGS =====
-WAKE_WORD = "hey pepper"  # What activates the robot
-GOODBYE_WORD = "bye pepper"  # What deactivates it
-ACTIVE_TIMEOUT = 60  # Seconds before auto-deactivating after last interaction
+WAKE_WORD      = "hey pepper"
+GOODBYE_WORD   = "bye pepper"
+ACTIVE_TIMEOUT = 60
 
 # ===== VOICE / STT SETTINGS =====
-VOICE_ENABLED      = True          # Master switch for voice input
-PTT_KEY            = 'r'           # Hold this key to record (Push-To-Talk)
-AUDIO_SAMPLE_RATE  = 16000         # Hz — 16 kHz is optimal for Whisper
-AUDIO_CHANNELS     = 1             # Mono is fine for speech
-AUDIO_MIN_DURATION = 0.5           # Ignore clips shorter than this (seconds)
-AUDIO_MAX_DURATION = 30.0          # Auto-stop after this many seconds
+VOICE_ENABLED     = True
+PTT_KEY           = 'r'
+AUDIO_SAMPLE_RATE = 16000
+AUDIO_CHANNELS    = 1
+AUDIO_MIN_DURATION = 0.5
+AUDIO_MAX_DURATION = 30.0
 
 # ===== TTS SETTINGS =====
-TTS_VOICE = "en-US-AriaNeural"  # Microsoft Edge TTS voice (female, clear)
-# Other good options: "en-US-GuyNeural" (male), "en-GB-SoniaNeural" (British)
-TTS_RATE = "+0%"  # Speed: -50% to +100%
+TTS_VOICE = "en-US-AriaNeural"
+TTS_RATE  = "+0%"
+
+# ===== SEARCH INTENT KEYWORDS =====
+# Used by GroqBrain.needs_search() for the fast-path pre-emptive search.
+# Any message containing one of these triggers a web search BEFORE the LLM call,
+# so the model only needs ONE API call (with context) instead of two.
+SEARCH_KEYWORDS = {
+    "latest", "recent", "current", "today", "tonight", "yesterday",
+    "this week", "this month", "this year", "right now", "just happened",
+    "news", "update", "2025", "2026", "who won", "what happened",
+    "score", "weather", "price", "stock", "election", "announcement",
+    "released", "launched", "new model", "broke", "breaking",
+}
 
 # ===== SYSTEM PROMPT =====
-SYSTEM_PROMPT = """You are Pepper, a friendly humanoid robot assistant in a classroom.
+# Dynamic date is injected at import time so it's always accurate.
+def _build_system_prompt() -> str:
+    today_str = date.today().strftime("%B %d, %Y")
+    return f"""You are Pepper, a friendly humanoid robot assistant in a classroom.
 
 IMPORTANT - Current Date & Context:
-- Today's date is February 13, 2026
+- Today's date is {today_str}
 - You have access to web_search function for current information
 - When you need recent/current info, use the web_search function
-- Always mention the current year (2026) when relevant
+- Always mention the current year when relevant
 
 Web Search Usage:
 - Use web_search("query") for: recent events, current news, latest developments
-- Use it when user asks about "latest", "recent", "current", or specific 2025-2026 events
+- Use it when user asks about "latest", "recent", "current", or specific events
 - Don't search for historical facts you already know
 
 Personality:
@@ -83,18 +91,16 @@ Context:
 
 Remember: Keep it snappy, keep it real, and be engaging!"""
 
+SYSTEM_PROMPT = _build_system_prompt()
+
 # ===== AVAILABLE ROBOT FUNCTIONS =====
-# These will be passed to Groq's function calling
 ROBOT_FUNCTIONS = [
     {
         "type": "function",
         "function": {
             "name": "wave",
             "description": "Make Pepper wave hello or goodbye with its arm",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+            "parameters": {"type": "object", "properties": {}}
         }
     },
     {
@@ -102,10 +108,7 @@ ROBOT_FUNCTIONS = [
         "function": {
             "name": "nod",
             "description": "Make Pepper nod its head in agreement or acknowledgment",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+            "parameters": {"type": "object", "properties": {}}
         }
     },
     {
@@ -113,98 +116,71 @@ ROBOT_FUNCTIONS = [
         "function": {
             "name": "shake_head",
             "description": "Make Pepper shake its head (disagree/no)",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+            "parameters": {"type": "object", "properties": {}}
         }
     },
     {
         "type": "function",
         "function": {
             "name": "thinking_gesture",
-            "description": "Make Pepper do a thinking gesture (hand to chin) when pondering or considering something",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+            "description": "Make Pepper do a thinking gesture (hand to chin) when pondering",
+            "parameters": {"type": "object", "properties": {}}
         }
     },
     {
         "type": "function",
         "function": {
             "name": "explaining_gesture",
-            "description": "Make Pepper use hand gestures while explaining something, makes explanations more dynamic and engaging",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+            "description": "Make Pepper use hand gestures while explaining something",
+            "parameters": {"type": "object", "properties": {}}
         }
     },
     {
         "type": "function",
         "function": {
             "name": "excited_gesture",
-            "description": "Make Pepper show excitement with both arms up, use when enthusiastic or celebrating",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+            "description": "Make Pepper show excitement with both arms up",
+            "parameters": {"type": "object", "properties": {}}
         }
     },
     {
         "type": "function",
         "function": {
             "name": "point_forward",
-            "description": "Make Pepper point forward, useful when directing attention or indicating direction",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+            "description": "Make Pepper point forward",
+            "parameters": {"type": "object", "properties": {}}
         }
     },
     {
         "type": "function",
         "function": {
             "name": "shrug",
-            "description": "Make Pepper shrug (I don't know gesture), use when uncertain or indicating lack of knowledge",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+            "description": "Make Pepper shrug (I don't know gesture)",
+            "parameters": {"type": "object", "properties": {}}
         }
     },
     {
         "type": "function",
         "function": {
             "name": "celebrate",
-            "description": "Make Pepper do a celebration gesture with arm waves, use for achievements or good news",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+            "description": "Make Pepper do a celebration gesture",
+            "parameters": {"type": "object", "properties": {}}
         }
     },
     {
         "type": "function",
         "function": {
             "name": "look_around",
-            "description": "Make Pepper look around left and right, useful when 'searching' or showing curiosity",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+            "description": "Make Pepper look around left and right",
+            "parameters": {"type": "object", "properties": {}}
         }
     },
     {
         "type": "function",
         "function": {
             "name": "bow",
-            "description": "Make Pepper bow politely, use for greetings or showing respect",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+            "description": "Make Pepper bow politely",
+            "parameters": {"type": "object", "properties": {}}
         }
     },
     {
@@ -212,23 +188,20 @@ ROBOT_FUNCTIONS = [
         "function": {
             "name": "look_at_sound",
             "description": "Make Pepper turn and look toward where sound is coming from",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+            "parameters": {"type": "object", "properties": {}}
         }
     },
     {
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web for current information. Use this when you need up-to-date facts, recent events, current news, or information that may have changed since your knowledge cutoff. Always use this for questions about 'recent', 'latest', 'current', or specific dates/events in 2025-2026.",
+            "description": "Search the web for current information. Use this when you need up-to-date facts, recent events, or current news.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search query to find information about (e.g. 'latest AI news', 'who won super bowl 2026', 'current president of france')"
+                        "description": "The search query"
                     }
                 },
                 "required": ["query"]

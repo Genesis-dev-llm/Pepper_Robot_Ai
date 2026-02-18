@@ -1,68 +1,110 @@
 """
-Pepper Robot Interface
-Handles all communication and control with Pepper via qi library
+Pepper Robot Interface — NAOqi hardware control
+
+Changes from original:
+- All public gesture methods are now non-blocking (fire-and-forget via daemon
+  threads).  A gesture lock ensures they don't physically overlap; a new
+  request while one is running is silently skipped rather than queuing up.
+- play_audio_file() SCPs the audio file to the robot's /tmp/ directory before
+  calling ALAudioPlayer.loadFile() — Pepper's audio player runs on the robot
+  and cannot access paths on the laptop's filesystem.
+- thinking_indicator() now spawns a real background pulse loop instead of just
+  setting the LED colour twice.
+- speak_hq() is a first-class method: generate HQ audio via a TTS handler,
+  play through ALAudioPlayer, fall back to built-in TTS on any failure.
 """
 
-import qi
-import time
-import threading
+import os
 import random
-from typing import Optional
+import threading
+import time
+from typing import Optional, TYPE_CHECKING
+
+import qi
+
+# paramiko is used to SCP audio files to the robot.
+# If not installed: pip install paramiko --break-system-packages
+try:
+    import paramiko
+    _PARAMIKO_AVAILABLE = True
+except ImportError:
+    _PARAMIKO_AVAILABLE = False
+    print("⚠️  paramiko not installed — HQ audio via ALAudioPlayer disabled")
+    print("   Install with: pip install paramiko --break-system-packages")
+
+if TYPE_CHECKING:
+    from hybrid_tts_handler import HybridTTSHandler
+
 
 class PepperRobot:
-    def __init__(self, ip: str, port: int):
-        """Initialize connection to Pepper robot"""
-        self.ip = ip
-        self.port = port
-        self.session = None
-        self.tts = None
-        self.motion = None
+    def __init__(self, ip: str, port: int,
+                 ssh_user: str = "nao", ssh_password: str = "nao"):
+        self.ip           = ip
+        self.port         = port
+        self.ssh_user     = ssh_user
+        self.ssh_password = ssh_password
+
+        # NAOqi services (set in connect())
+        self.session        = None
+        self.tts            = None
+        self.motion         = None
         self.animated_speech = None
-        self.audio = None
-        self.leds = None
-        self.awareness = None
-        self._speech_lock = threading.Lock()   # Prevent overlapping speech
-        self._is_speaking_hq = False           # Flag for HQ audio animation loop
-        
+        self.audio          = None
+        self.leds           = None
+        self.awareness      = None
+
+        # Speech concurrency — acquired for the duration of any speech output.
+        self._speech_lock = threading.Lock()
+
+        # Gesture concurrency — skip new gesture if one is already running.
+        self._gesture_lock = threading.Lock()
+
+        # Thinking-indicator state
+        self._thinking         = False
+        self._thinking_thread: Optional[threading.Thread] = None
+
+        # HQ audio animation state
+        self._is_speaking_hq = False
+
+    # ------------------------------------------------------------------
+    # Connection
+    # ------------------------------------------------------------------
+
     def connect(self) -> bool:
-        """Establish connection to Pepper"""
         try:
-            print(f"🤖 Connecting to Pepper at {self.ip}:{self.port}...")
+            print(f"🤖 Connecting to Pepper at {self.ip}:{self.port}…")
             self.session = qi.Session()
             self.session.connect(f"tcp://{self.ip}:{self.port}")
-            
-            # Initialize services
-            self.tts = self.session.service("ALTextToSpeech")
-            self.motion = self.session.service("ALMotion")
+
+            self.tts             = self.session.service("ALTextToSpeech")
+            self.motion          = self.session.service("ALMotion")
             self.animated_speech = self.session.service("ALAnimatedSpeech")
-            self.audio = self.session.service("ALAudioDevice")
-            self.leds = self.session.service("ALLeds")
-            self.awareness = self.session.service("ALBasicAwareness")
-            
-            # Wake up and set posture
+            self.audio           = self.session.service("ALAudioDevice")
+            self.leds            = self.session.service("ALLeds")
+            self.awareness       = self.session.service("ALBasicAwareness")
+
             self.motion.wakeUp()
             time.sleep(1)
-            
-            print("✅ Connected to Pepper successfully!")
+            print("✅ Connected to Pepper!")
             return True
-            
         except Exception as e:
-            print(f"❌ Failed to connect to Pepper: {e}")
+            print(f"❌ Connection failed: {e}")
             return False
-    
+
     def disconnect(self):
-        """Safely disconnect from Pepper"""
         try:
             if self.motion:
                 self.motion.rest()
             print("👋 Disconnected from Pepper")
         except Exception as e:
-            print(f"⚠️ Error during disconnect: {e}")
-    
-    # ===== SPEECH =====
-    
+            print(f"⚠️  Disconnect error: {e}")
+
+    # ------------------------------------------------------------------
+    # Speech — built-in NAOqi TTS
+    # ------------------------------------------------------------------
+
     def speak(self, text: str, use_animation: bool = True):
-        """Make Pepper speak text (thread-safe — blocks if already speaking)."""
+        """Blocking built-in TTS (thread-safe)."""
         with self._speech_lock:
             try:
                 if use_animation and self.animated_speech:
@@ -71,386 +113,386 @@ class PepperRobot:
                     self.tts.say(text)
             except Exception as e:
                 print(f"❌ Speech error: {e}")
-    
+
     def set_volume(self, volume: int):
-        """Set speech volume (0-100)"""
         try:
             self.tts.setVolume(volume / 100.0)
         except Exception as e:
             print(f"❌ Volume error: {e}")
-    
-    # ===== AUDIO CAPTURE =====
-    
-    def start_audio_capture(self):
-        """Start capturing audio from microphones"""
-        # This is handled differently - usually you'd use ALAudioRecorder
-        # or subscribe to ALAudioDevice for streaming
-        pass
 
-    def play_audio_file(self, file_path: str) -> bool:
+    # ------------------------------------------------------------------
+    # Speech — HQ audio pipeline
+    # ------------------------------------------------------------------
+
+    def speak_hq(self, text: str, tts_handler: "HybridTTSHandler") -> bool:
         """
-        Play a local audio file through Pepper's speakers via ALAudioPlayer.
-        Includes a background thread to handle animations (gestures/LEDs)
-        so Pepper doesn't look like a statue while speaking external audio.
+        Generate audio via the hybrid TTS handler and play through
+        ALAudioPlayer (Pepper's own speakers).
+
+        Falls back to built-in NAOqi TTS on any failure so there is
+        always some voice output.
+
+        Returns True if HQ path succeeded, False if fallback was used.
         """
-        with self._speech_lock:
-            try:
-                player = self.session.service("ALAudioPlayer")
-                file_id = player.loadFile(file_path)
-                
-                # Start background animation loop
-                self._is_speaking_hq = True
-                anim_thread = threading.Thread(
-                    target=self._hq_speech_animation_loop,
-                    daemon=True,
-                    name="HQSpeechAnimation"
-                )
-                anim_thread.start()
-                
-                # Play audio (this blocks until done)
-                player.play(file_id)
-                
-                # Stop animation loop
-                self._is_speaking_hq = False
+        try:
+            audio_path = tts_handler.speak(text)
+            if audio_path and self.play_audio_file(audio_path):
+                try:
+                    os.remove(audio_path)
+                except OSError:
+                    pass
                 return True
-            except Exception as e:
-                self._is_speaking_hq = False
-                print(f"⚠️ ALAudioPlayer failed ({e}), falling back to built-in TTS")
-                return False
+        except Exception as e:
+            print(f"⚠️  HQ TTS pipeline error: {e}")
+
+        # Fallback
+        print("↩️  Falling back to built-in NAOqi TTS")
+        self.speak(text)
+        return False
+
+    def play_audio_file(self, file_path: str, lock_timeout: float = 0.5) -> bool:
+        """
+        Play an audio file through Pepper's speakers via ALAudioPlayer.
+
+        Because ALAudioPlayer runs on the robot, it cannot access paths on the
+        laptop filesystem.  This method:
+          1. SCPs the file to /tmp/ on the robot via paramiko/SFTP.
+          2. Calls ALAudioPlayer.loadFile() with the remote path.
+          3. Cleans up the remote file when done.
+
+        Falls back gracefully if paramiko is unavailable or transfer fails.
+        """
+        if not _PARAMIKO_AVAILABLE:
+            print("⚠️  paramiko unavailable — cannot transfer audio to robot")
+            return False
+
+        acquired = self._speech_lock.acquire(timeout=lock_timeout)
+        if not acquired:
+            print("⚠️  Already speaking — skipping audio playback")
+            return False
+
+        remote_path = f"/tmp/{os.path.basename(file_path)}"
+        try:
+            # ── 1. SCP file to robot ──────────────────────────────────
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                self.ip,
+                username=self.ssh_user,
+                password=self.ssh_password,
+                timeout=5,
+            )
+            sftp = ssh.open_sftp()
+            sftp.put(file_path, remote_path)
+            sftp.close()
+            ssh.close()
+
+            # ── 2. Play via ALAudioPlayer ─────────────────────────────
+            player  = self.session.service("ALAudioPlayer")
+            file_id = player.loadFile(remote_path)
+
+            self._is_speaking_hq = True
+            anim = threading.Thread(
+                target=self._hq_speech_animation_loop,
+                daemon=True,
+                name="HQSpeechAnim",
+            )
+            anim.start()
+
+            player.play(file_id)      # Blocks until done
+            self._is_speaking_hq = False
+
+            # ── 3. Clean up remote file ───────────────────────────────
+            try:
+                ssh2 = paramiko.SSHClient()
+                ssh2.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh2.connect(self.ip, username=self.ssh_user,
+                             password=self.ssh_password, timeout=3)
+                ssh2.exec_command(f"rm -f {remote_path}")
+                ssh2.close()
+            except Exception:
+                pass  # Non-critical cleanup — ignore failures
+
+            return True
+
+        except Exception as e:
+            self._is_speaking_hq = False
+            print(f"⚠️  ALAudioPlayer failed: {e}")
+            return False
+        finally:
+            self._speech_lock.release()
 
     def _hq_speech_animation_loop(self):
-        """Internal loop to trigger gestures while HQ audio is playing."""
-        gestures = [self.nod, self.explaining_gesture, self.thinking_gesture, self.look_around]
-        
+        """Background gestures + LED pulse while HQ audio is playing."""
+        gesture_fns = [
+            self._nod_impl,
+            self._explaining_gesture_impl,
+            self._thinking_gesture_impl,
+            self._look_around_impl,
+        ]
         while self._is_speaking_hq:
             try:
-                # 1. Pulse eyes
                 self.set_eye_color("blue")
-                
-                # 2. Pick a random gesture occasionally
-                if random.random() > 0.6:  # 40% chance every 2-3 seconds
-                    gesture_func = random.choice(gestures)
-                    gesture_func()
-                
-                # 3. Short wait to keep loop reactive
-                for _ in range(20): # Sleep 2s but check flag every 100ms
-                    if not self._is_speaking_hq: break
+                if random.random() > 0.6:
+                    random.choice(gesture_fns)()
+                # Sleep in small increments so we stay responsive to the flag
+                for _ in range(20):
+                    if not self._is_speaking_hq:
+                        break
                     time.sleep(0.1)
-                    
             except Exception as e:
-                print(f"⚠️ HQ Animation loop error: {e}")
+                print(f"⚠️  HQ anim loop error: {e}")
                 break
-        
-        # Reset eyes when done
         self.set_eye_color("blue")
-    
-    # ===== MOVEMENTS =====
-    
-    def wave(self):
-        """Wave hello/goodbye"""
+
+    # ------------------------------------------------------------------
+    # Thinking indicator — actual pulsing LED
+    # ------------------------------------------------------------------
+
+    def thinking_indicator(self, start: bool = True):
+        """
+        start=True  → begin a background LED-pulse loop
+        start=False → stop the loop and restore steady blue
+        """
+        if start:
+            self._thinking = True
+            if self._thinking_thread is None or not self._thinking_thread.is_alive():
+                self._thinking_thread = threading.Thread(
+                    target=self._pulse_thinking_loop,
+                    daemon=True,
+                    name="ThinkingPulse",
+                )
+                self._thinking_thread.start()
+        else:
+            self._thinking = False
+            # Thread will exit on its own; restore eyes immediately
+            self.set_eye_color("blue")
+
+    def _pulse_thinking_loop(self):
+        colours = ["blue", "off"]
+        idx = 0
+        while self._thinking:
+            try:
+                self.set_eye_color(colours[idx % 2])
+                idx += 1
+                # 0.4s per blink phase
+                for _ in range(4):
+                    if not self._thinking:
+                        break
+                    time.sleep(0.1)
+            except Exception:
+                break
+
+    # ------------------------------------------------------------------
+    # Gesture dispatcher — all public gesture methods are non-blocking
+    # ------------------------------------------------------------------
+
+    def _run_gesture(self, impl_fn, *args, **kwargs):
+        """
+        Fire-and-forget gesture execution.
+
+        The gesture lock is acquired atomically inside the worker thread.
+        If it can't be acquired (another gesture running), the request is
+        silently dropped — no queueing, no blocking, no TOCTOU race.
+        """
+        def _worker():
+            if not self._gesture_lock.acquire(blocking=False):
+                return   # Another gesture is running — skip this one
+            try:
+                impl_fn(*args, **kwargs)
+            finally:
+                self._gesture_lock.release()
+
+        threading.Thread(target=_worker, daemon=True, name="Gesture").start()
+
+    # Public gesture API — all delegate to _run_gesture
+    def wave(self):             self._run_gesture(self._wave_impl)
+    def nod(self):              self._run_gesture(self._nod_impl)
+    def shake_head(self):       self._run_gesture(self._shake_head_impl)
+    def look_at_sound(self):    self._run_gesture(self._look_at_sound_impl)
+    def thinking_gesture(self): self._run_gesture(self._thinking_gesture_impl)
+    def explaining_gesture(self): self._run_gesture(self._explaining_gesture_impl)
+    def excited_gesture(self):  self._run_gesture(self._excited_gesture_impl)
+    def point_forward(self):    self._run_gesture(self._point_forward_impl)
+    def shrug(self):            self._run_gesture(self._shrug_impl)
+    def celebrate(self):        self._run_gesture(self._celebrate_impl)
+    def look_around(self):      self._run_gesture(self._look_around_impl)
+    def bow(self):              self._run_gesture(self._bow_impl)
+
+    # ------------------------------------------------------------------
+    # Gesture implementations (blocking — always run inside _run_gesture)
+    # ------------------------------------------------------------------
+
+    def _wave_impl(self):
         try:
-            print("👋 Waving...")
-            # Right arm wave
-            names = ["RShoulderPitch", "RShoulderRoll", "RElbowRoll", "RElbowYaw"]
-            
-            # Wave animation
-            angles1 = [-0.5, -0.3, 1.5, 1.2]  # Arm up
-            angles2 = [-0.5, -0.3, 1.0, 1.2]  # Wave down
-            angles3 = [-0.5, -0.3, 1.5, 1.2]  # Wave up
-            
-            self.motion.setAngles(names, angles1, 0.2)
-            time.sleep(0.3)
-            
-            # Wave motion
+            names   = ["RShoulderPitch", "RShoulderRoll", "RElbowRoll", "RElbowYaw"]
+            up      = [-0.5, -0.3, 1.5, 1.2]
+            down    = [-0.5, -0.3, 1.0, 1.2]
+            rest    = [ 1.5,  0.15, 0.5, 1.2]
+            self.motion.setAngles(names, up, 0.2);   time.sleep(0.3)
             for _ in range(2):
-                self.motion.setAngles(names, angles2, 0.3)
-                time.sleep(0.2)
-                self.motion.setAngles(names, angles3, 0.3)
-                time.sleep(0.2)
-            
-            # Return to rest
-            self.motion.setAngles(names, [1.5, 0.15, 0.5, 1.2], 0.2)
-            
+                self.motion.setAngles(names, down, 0.3); time.sleep(0.2)
+                self.motion.setAngles(names, up,   0.3); time.sleep(0.2)
+            self.motion.setAngles(names, rest, 0.2)
         except Exception as e:
             print(f"❌ Wave error: {e}")
-    
-    def nod(self):
-        """Nod head yes"""
+
+    def _nod_impl(self):
         try:
-            print("😊 Nodding...")
-            # Head pitch control
-            names = "HeadPitch"
-            
-            # Nod down and up
-            self.motion.setAngles(names, 0.3, 0.15)  # Down
-            time.sleep(0.3)
-            self.motion.setAngles(names, -0.1, 0.15)  # Up
-            time.sleep(0.3)
-            self.motion.setAngles(names, 0.0, 0.15)  # Center
-            
+            self.motion.setAngles("HeadPitch",  0.3, 0.15); time.sleep(0.3)
+            self.motion.setAngles("HeadPitch", -0.1, 0.15); time.sleep(0.3)
+            self.motion.setAngles("HeadPitch",  0.0, 0.15)
         except Exception as e:
             print(f"❌ Nod error: {e}")
-    
-    def shake_head(self):
-        """Shake head no"""
+
+    def _shake_head_impl(self):
         try:
-            print("🙅 Shaking head...")
-            names = "HeadYaw"
-            
-            # Shake left and right
-            self.motion.setAngles(names, 0.4, 0.15)  # Right
-            time.sleep(0.3)
-            self.motion.setAngles(names, -0.4, 0.15)  # Left
-            time.sleep(0.3)
-            self.motion.setAngles(names, 0.0, 0.15)  # Center
-            
+            self.motion.setAngles("HeadYaw",  0.4, 0.15); time.sleep(0.3)
+            self.motion.setAngles("HeadYaw", -0.4, 0.15); time.sleep(0.3)
+            self.motion.setAngles("HeadYaw",  0.0, 0.15)
         except Exception as e:
             print(f"❌ Shake head error: {e}")
-    
-    def look_at_sound(self):
-        """Turn head toward sound source"""
+
+    def _look_at_sound_impl(self):
         try:
-            print("👂 Looking at sound source...")
-            # Enable awareness to track people
             if self.awareness:
                 self.awareness.setEnabled(True)
         except Exception as e:
             print(f"❌ Look at sound error: {e}")
-    
-    def thinking_gesture(self):
-        """Thinking pose - hand to chin"""
+
+    def _thinking_gesture_impl(self):
         try:
-            print("🤔 Thinking gesture...")
-            # Right hand to chin area
-            names = ["RShoulderPitch", "RShoulderRoll", "RElbowRoll", "RElbowYaw", "RWristYaw"]
-            angles = [-0.3, -0.3, 1.2, 1.0, 0.0]
-            
-            self.motion.setAngles(names, angles, 0.15)
-            time.sleep(1.0)
-            
-            # Return to rest
-            self.motion.setAngles(names, [1.5, 0.15, 0.5, 1.2, 0.0], 0.15)
-            
+            names  = ["RShoulderPitch", "RShoulderRoll", "RElbowRoll", "RElbowYaw", "RWristYaw"]
+            pose   = [-0.3, -0.3, 1.2, 1.0, 0.0]
+            rest   = [ 1.5,  0.15, 0.5, 1.2, 0.0]
+            self.motion.setAngles(names, pose, 0.15); time.sleep(1.0)
+            self.motion.setAngles(names, rest, 0.15)
         except Exception as e:
             print(f"❌ Thinking gesture error: {e}")
-    
-    def explaining_gesture(self):
-        """Hand gestures while explaining"""
+
+    def _explaining_gesture_impl(self):
         try:
-            print("✋ Explaining gesture...")
-            # Both hands move expressively
             names = ["RShoulderPitch", "RShoulderRoll", "RElbowRoll",
-                    "LShoulderPitch", "LShoulderRoll", "LElbowRoll"]
-            
-            # Open gesture
-            angles1 = [0.0, -0.3, 1.0, 0.0, 0.3, -1.0]
-            self.motion.setAngles(names, angles1, 0.2)
-            time.sleep(0.4)
-            
-            # Close gesture
-            angles2 = [0.5, -0.1, 0.5, 0.5, 0.1, -0.5]
-            self.motion.setAngles(names, angles2, 0.2)
-            time.sleep(0.4)
-            
-            # Return to rest
-            rest = [1.5, 0.15, 0.5, 1.5, -0.15, -0.5]
-            self.motion.setAngles(names, rest, 0.2)
-            
+                     "LShoulderPitch", "LShoulderRoll", "LElbowRoll"]
+            open_ = [ 0.0, -0.3,  1.0,  0.0,  0.3, -1.0]
+            close = [ 0.5, -0.1,  0.5,  0.5,  0.1, -0.5]
+            rest  = [ 1.5,  0.15, 0.5,  1.5, -0.15, -0.5]
+            self.motion.setAngles(names, open_, 0.2); time.sleep(0.4)
+            self.motion.setAngles(names, close, 0.2); time.sleep(0.4)
+            self.motion.setAngles(names, rest,  0.2)
         except Exception as e:
             print(f"❌ Explaining gesture error: {e}")
-    
-    def excited_gesture(self):
-        """Excited - both arms up"""
+
+    def _excited_gesture_impl(self):
         try:
-            print("🎉 Excited gesture...")
-            # Both arms up
             names = ["RShoulderPitch", "RShoulderRoll", "RElbowRoll",
-                    "LShoulderPitch", "LShoulderRoll", "LElbowRoll"]
-            
-            angles = [-1.0, -0.3, 1.5, -1.0, 0.3, -1.5]
-            self.motion.setAngles(names, angles, 0.15)
-            time.sleep(0.8)
-            
-            # Return to rest
-            rest = [1.5, 0.15, 0.5, 1.5, -0.15, -0.5]
+                     "LShoulderPitch", "LShoulderRoll", "LElbowRoll"]
+            up   = [-1.0, -0.3,  1.5, -1.0,  0.3, -1.5]
+            rest = [ 1.5,  0.15, 0.5,  1.5, -0.15, -0.5]
+            self.motion.setAngles(names, up,   0.15); time.sleep(0.8)
             self.motion.setAngles(names, rest, 0.15)
-            
         except Exception as e:
             print(f"❌ Excited gesture error: {e}")
-    
-    def point_forward(self):
-        """Point forward with right hand"""
+
+    def _point_forward_impl(self):
         try:
-            print("👉 Pointing gesture...")
-            # Right arm point
             names = ["RShoulderPitch", "RShoulderRoll", "RElbowRoll", "RElbowYaw"]
-            angles = [0.0, -0.3, 0.0, 1.5]
-            
-            self.motion.setAngles(names, angles, 0.15)
-            time.sleep(1.0)
-            
-            # Return to rest
-            self.motion.setAngles(names, [1.5, 0.15, 0.5, 1.2], 0.15)
-            
+            point = [ 0.0, -0.3,  0.0,  1.5]
+            rest  = [ 1.5,  0.15, 0.5,  1.2]
+            self.motion.setAngles(names, point, 0.15); time.sleep(1.0)
+            self.motion.setAngles(names, rest,  0.15)
         except Exception as e:
             print(f"❌ Point error: {e}")
-    
-    def shrug(self):
-        """Shrug gesture (I don't know)"""
+
+    def _shrug_impl(self):
         try:
-            print("🤷 Shrug gesture...")
-            # Both shoulders up, arms slightly out
             names = ["RShoulderPitch", "RShoulderRoll", "RElbowRoll",
-                    "LShoulderPitch", "LShoulderRoll", "LElbowRoll",
-                    "HeadPitch"]
-            
-            # Shrug position
-            angles = [0.5, -0.5, 1.2, 0.5, 0.5, -1.2, 0.2]
-            self.motion.setAngles(names, angles, 0.15)
-            time.sleep(0.8)
-            
-            # Return to rest
-            rest = [1.5, 0.15, 0.5, 1.5, -0.15, -0.5, 0.0]
+                     "LShoulderPitch", "LShoulderRoll", "LElbowRoll",
+                     "HeadPitch"]
+            pose = [0.5, -0.5,  1.2,  0.5,  0.5, -1.2,  0.2]
+            rest = [1.5,  0.15, 0.5,  1.5, -0.15, -0.5,  0.0]
+            self.motion.setAngles(names, pose, 0.15); time.sleep(0.8)
             self.motion.setAngles(names, rest, 0.15)
-            
         except Exception as e:
             print(f"❌ Shrug error: {e}")
-    
-    def celebrate(self):
-        """Celebration gesture - arms wave"""
+
+    def _celebrate_impl(self):
         try:
-            print("🎊 Celebrate gesture...")
             names = ["RShoulderPitch", "RShoulderRoll", "RElbowRoll",
-                    "LShoulderPitch", "LShoulderRoll", "LElbowRoll"]
-            
-            # Wave both arms
+                     "LShoulderPitch", "LShoulderRoll", "LElbowRoll"]
+            up   = [-0.5, -0.3,  1.5, -0.5,  0.3, -1.5]
+            down = [ 0.0, -0.3,  1.0,  0.0,  0.3, -1.0]
+            rest = [ 1.5,  0.15, 0.5,  1.5, -0.15, -0.5]
             for _ in range(2):
-                # Up
-                angles1 = [-0.5, -0.3, 1.5, -0.5, 0.3, -1.5]
-                self.motion.setAngles(names, angles1, 0.25)
-                time.sleep(0.3)
-                
-                # Down
-                angles2 = [0.0, -0.3, 1.0, 0.0, 0.3, -1.0]
-                self.motion.setAngles(names, angles2, 0.25)
-                time.sleep(0.3)
-            
-            # Return to rest
-            rest = [1.5, 0.15, 0.5, 1.5, -0.15, -0.5]
+                self.motion.setAngles(names, up,   0.25); time.sleep(0.3)
+                self.motion.setAngles(names, down, 0.25); time.sleep(0.3)
             self.motion.setAngles(names, rest, 0.2)
-            
         except Exception as e:
             print(f"❌ Celebrate error: {e}")
-    
-    def look_around(self):
-        """Look around left and right"""
+
+    def _look_around_impl(self):
         try:
-            print("👀 Looking around...")
-            names = "HeadYaw"
-            
-            # Look right
-            self.motion.setAngles(names, -0.5, 0.15)
-            time.sleep(0.5)
-            
-            # Look left
-            self.motion.setAngles(names, 0.5, 0.15)
-            time.sleep(0.5)
-            
-            # Center
-            self.motion.setAngles(names, 0.0, 0.15)
-            
+            self.motion.setAngles("HeadYaw", -0.5, 0.15); time.sleep(0.5)
+            self.motion.setAngles("HeadYaw",  0.5, 0.15); time.sleep(0.5)
+            self.motion.setAngles("HeadYaw",  0.0, 0.15)
         except Exception as e:
             print(f"❌ Look around error: {e}")
-    
-    def bow(self):
-        """Bow politely"""
+
+    def _bow_impl(self):
         try:
-            print("🙇 Bowing...")
-            # Head and torso down
-            self.motion.setAngles("HeadPitch", 0.5, 0.1)
-            time.sleep(0.5)
-            
-            # Back up
-            self.motion.setAngles("HeadPitch", 0.0, 0.1)
-            time.sleep(0.3)
-            
+            self.motion.setAngles("HeadPitch", 0.5, 0.1); time.sleep(0.5)
+            self.motion.setAngles("HeadPitch", 0.0, 0.1); time.sleep(0.3)
         except Exception as e:
             print(f"❌ Bow error: {e}")
-    
-    # ===== KEYBOARD MOVEMENT CONTROLS =====
-    
-    def move_forward(self, speed: float = 0.5):
-        """Move forward"""
-        try:
-            self.motion.move(speed, 0, 0)
-        except Exception as e:
-            print(f"❌ Move forward error: {e}")
-    
-    def move_backward(self, speed: float = 0.5):
-        """Move backward"""
-        try:
-            self.motion.move(-speed, 0, 0)
-        except Exception as e:
-            print(f"❌ Move backward error: {e}")
-    
-    def turn_left(self, speed: float = 0.5):
-        """Turn left"""
-        try:
-            self.motion.move(0, 0, speed)
-        except Exception as e:
-            print(f"❌ Turn left error: {e}")
-    
-    def turn_right(self, speed: float = 0.5):
-        """Turn right"""
-        try:
-            self.motion.move(0, 0, -speed)
-        except Exception as e:
-            print(f"❌ Turn right error: {e}")
-    
-    def strafe_left(self, speed: float = 0.3):
-        """Strafe left"""
-        try:
-            self.motion.move(0, speed, 0)
-        except Exception as e:
-            print(f"❌ Strafe left error: {e}")
-    
-    def strafe_right(self, speed: float = 0.3):
-        """Strafe right"""
-        try:
-            self.motion.move(0, -speed, 0)
-        except Exception as e:
-            print(f"❌ Strafe right error: {e}")
-    
+
+    # ------------------------------------------------------------------
+    # Movement (called at 10 Hz from movement_controller thread)
+    # ------------------------------------------------------------------
+
+    def move_forward(self,  speed: float = 0.5):
+        print(f"[DBG] move_forward speed={speed}")
+        self._move(speed,    0,  0)
+    def move_backward(self, speed: float = 0.5): self._move(-speed,   0,  0)
+    def turn_left(self,     speed: float = 0.5): self._move(0,        0,  speed)
+    def turn_right(self,    speed: float = 0.5): self._move(0,        0, -speed)
+    def strafe_left(self,   speed: float = 0.3): self._move(0,  speed,  0)
+    def strafe_right(self,  speed: float = 0.3): self._move(0, -speed,  0)
+
     def stop_movement(self):
-        """Stop all movement"""
         try:
             self.motion.stopMove()
         except Exception as e:
             print(f"❌ Stop error: {e}")
-    
-    # ===== LED CONTROL =====
-    
-    def set_eye_color(self, color: str):
-        """Set eye LED color (blue, green, red, yellow, white)"""
+
+    def _move(self, x, y, theta):
         try:
-            color_map = {
-                "blue": 0x000000FF,
-                "green": 0x0000FF00,
-                "red": 0x00FF0000,
-                "yellow": 0x00FFFF00,
-                "white": 0x00FFFFFF,
-                "off": 0x00000000
-            }
-            
-            if color in color_map:
-                self.leds.fadeRGB("FaceLeds", color_map[color], 0.5)
+            self.motion.move(x, y, theta)
+        except Exception as e:
+            print(f"❌ Move error: {e}")
+
+    # ------------------------------------------------------------------
+    # LEDs
+    # ------------------------------------------------------------------
+
+    _COLOUR_MAP = {
+        "blue":   0x000000FF,
+        "green":  0x0000FF00,
+        "red":    0x00FF0000,
+        "yellow": 0x00FFFF00,
+        "white":  0x00FFFFFF,
+        "off":    0x00000000,
+    }
+
+    def set_eye_color(self, color: str):
+        try:
+            rgb = self._COLOUR_MAP.get(color)
+            if rgb is not None:
+                self.leds.fadeRGB("FaceLeds", rgb, 0.5)
         except Exception as e:
             print(f"❌ LED error: {e}")
-    
+
     def pulse_eyes(self, color: str = "blue", duration: float = 2.0):
-        """Pulse eye LEDs"""
         try:
-            # Simple pulse effect
             self.set_eye_color(color)
             time.sleep(duration / 2)
             self.set_eye_color("off")
@@ -458,20 +500,3 @@ class PepperRobot:
             self.set_eye_color(color)
         except Exception as e:
             print(f"❌ Pulse error: {e}")
-    
-    def thinking_indicator(self, start: bool = True):
-        """
-        Show thinking indicator (pulsing blue eyes)
-        
-        Args:
-            start: True to start thinking animation, False to stop
-        """
-        try:
-            if start:
-                # Pulsing blue = thinking
-                self.leds.fadeRGB("FaceLeds", 0x000000FF, 0.5)
-            else:
-                # Return to steady blue
-                self.leds.fadeRGB("FaceLeds", 0x000000FF, 0.2)
-        except Exception as e:
-            print(f"❌ Thinking indicator error: {e}")
