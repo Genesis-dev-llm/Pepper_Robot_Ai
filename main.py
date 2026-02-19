@@ -286,6 +286,7 @@ def on_press(key):
 
         # ── Movement ──────────────────────────────────────────────────────
         if k in movement_keys:
+            print(f"[KEY] '{k}' pressed — robot_active={state.robot_active} pepper_ok={_pepper_ok()} focused={gui.text_input_focused if gui else False}")
             movement_keys[k]             = True
             state.last_movement_key_time = time.time()
             return
@@ -362,9 +363,16 @@ def movement_controller():
     """
     WATCHDOG_TIMEOUT = 2.0
     SEND_INTERVAL    = 0.1   # 10 Hz
+    loop_count       = 0
 
     while state.running:
         try:
+            # Print every 50 loops (5 seconds) to confirm loop is alive
+            loop_count += 1
+            if loop_count % 50 == 0:
+                any_k = any(movement_keys.values())
+                print(f"[CTRL] alive — active={state.robot_active} ok={_pepper_ok()} keys={dict(movement_keys)} any={any_k}")
+
             if not _pepper_ok() or not state.robot_active:
                 time.sleep(SEND_INTERVAL)
                 continue
