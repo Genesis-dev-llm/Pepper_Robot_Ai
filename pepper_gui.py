@@ -1,17 +1,5 @@
 """
 DearPyGUI Interface for Pepper AI Chat
-
-Changes from previous version:
-- Keyboard gate is now event-driven instead of per-frame polled.
-  DPG item_activated_handler / item_deactivated_handler on the input box
-  flip text_input_focused exactly when the cursor appears/disappears.
-  No more dpg.is_item_focused() in the render loop — zero lag, zero race.
-- Status queue is now latest-wins: the entire queue is drained each frame
-  but only the last item is applied, so rapid status updates don't flash
-  invisibly and then disappear.
-- Scroll-to-bottom is deferred by one frame via a pending flag so DPG has
-  time to recalculate scroll_max before we try to jump to it.
-- MAX_CHAT_MESSAGES cap and per-group widget tags are unchanged.
 """
 
 import queue
@@ -25,20 +13,20 @@ MAX_CHAT_MESSAGES = 60
 
 
 class PepperDearPyGUI:
-    def __init__(self, message_callback):
-        self.message_callback   = message_callback
-        self.is_running         = False
-        self.message_queue      = queue.Queue()
-        self.status_queue       = queue.Queue()
+    def __init__(self, message_callback, volume_callback=None):
+        self.message_callback  = message_callback
+        self.volume_callback   = volume_callback   # fn(int 0–100) — wired to pepper.set_volume
+        self.is_running        = False
+        self.message_queue     = queue.Queue()
+        self.status_queue      = queue.Queue()
 
         # Written only from DPG callbacks (main thread) — read from pynput thread.
-        # No lock needed: bool assignment is atomic in CPython, and the flag is
-        # only set by two well-defined DPG events.
+        # No lock needed: bool assignment is atomic in CPython.
         self.text_input_focused = False
 
         self._msg_tag_counter      = 0
         self._msg_tags: list       = []
-        self._scroll_pending: bool = False   # Deferred scroll-to-bottom flag
+        self._scroll_pending: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -51,9 +39,9 @@ class PepperDearPyGUI:
         dpg.create_viewport(
             title      = "🤖 Pepper AI Control Dashboard",
             width      = 900,
-            height     = 740,
+            height     = 780,
             min_width  = 600,
-            min_height = 450,
+            min_height = 480,
         )
         dpg.setup_dearpygui()
         dpg.show_viewport()
@@ -122,13 +110,26 @@ class PepperDearPyGUI:
                 dpg.add_button(label="Send", width=90,
                                callback=self._send_text_message)
 
-            # ── Cursor-based keyboard gate ────────────────────────────
-            # activated   → cursor appears  → suppress robot commands
-            # deactivated → cursor disappears → restore robot commands
+            # Cursor-based keyboard gate
             with dpg.item_handler_registry(tag="input_focus_handler"):
                 dpg.add_item_activated_handler(callback=self._on_input_activated)
                 dpg.add_item_deactivated_handler(callback=self._on_input_deactivated)
             dpg.bind_item_handler_registry("message_input", "input_focus_handler")
+
+            dpg.add_separator()
+
+            # ── Volume slider ─────────────────────────────────────────
+            with dpg.group(horizontal=True):
+                dpg.add_text("🔊 Volume:", color=(200, 200, 200))
+                dpg.add_slider_int(
+                    tag            = "volume_slider",
+                    default_value  = 100,
+                    min_value      = 0,
+                    max_value      = 100,
+                    width          = 300,
+                    callback       = self._on_volume_changed,
+                    format         = "%d%%",
+                )
 
             dpg.add_separator()
 
@@ -146,16 +147,22 @@ class PepperDearPyGUI:
         self._add_system_message("Press SPACE (outside input box) to wake Pepper")
 
     # ------------------------------------------------------------------
-    # Keyboard gate callbacks — only ever called from DPG main thread
+    # Keyboard gate callbacks
     # ------------------------------------------------------------------
 
     def _on_input_activated(self):
-        """Cursor appeared in the text box — block all robot key commands."""
         self.text_input_focused = True
 
     def _on_input_deactivated(self):
-        """Cursor left the text box — restore robot key commands."""
         self.text_input_focused = False
+
+    # ------------------------------------------------------------------
+    # Volume callback
+    # ------------------------------------------------------------------
+
+    def _on_volume_changed(self, sender, app_data):
+        if self.volume_callback:
+            self.volume_callback(int(app_data))
 
     # ------------------------------------------------------------------
     # Send callback
@@ -166,7 +173,6 @@ class PepperDearPyGUI:
         if not message:
             return
         dpg.set_value("message_input", "")
-        # Unfocus the input box so robot controls are immediately restored
         dpg.focus_item("main_window")
         self._add_user_message(message, voice=False)
         threading.Thread(
@@ -208,8 +214,6 @@ class PepperDearPyGUI:
                 dpg.delete_item(old_tag)
             except Exception:
                 pass
-        # Schedule scroll rather than calling it immediately — DPG needs one
-        # more frame to recalculate scroll_max after adding the new widget.
         self._scroll_pending = True
 
     def _add_user_message(self, message: str, voice: bool = False):
@@ -246,12 +250,10 @@ class PepperDearPyGUI:
     # ------------------------------------------------------------------
 
     def _process_queues(self):
-        # Deferred scroll — applied one frame after the widget was added
         if self._scroll_pending:
             dpg.set_y_scroll("chat_window", dpg.get_y_scroll_max("chat_window"))
             self._scroll_pending = False
 
-        # Message queue — process all pending items
         while not self.message_queue.empty():
             try:
                 kind, data = self.message_queue.get_nowait()
@@ -269,7 +271,6 @@ class PepperDearPyGUI:
             except queue.Empty:
                 break
 
-        # Status queue — latest-wins: drain all, apply only the last one
         last_status = None
         while not self.status_queue.empty():
             try:
@@ -280,7 +281,7 @@ class PepperDearPyGUI:
             try:
                 dpg.set_value("status_text", f"Status: {last_status}")
             except Exception:
-                pass  # DPG context may already be destroyed on shutdown
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +293,10 @@ if __name__ == "__main__":
         time.sleep(0.8)
         gui.add_pepper_message(f"Echo: {message}")
 
-    gui = PepperDearPyGUI(test_callback)
+    def test_volume(vol):
+        print(f"Volume: {vol}")
+
+    gui = PepperDearPyGUI(test_callback, volume_callback=test_volume)
     print("Starting DearPyGUI test…")
     gui.start()
     print("GUI closed.")

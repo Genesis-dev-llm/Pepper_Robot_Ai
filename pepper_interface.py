@@ -1,17 +1,5 @@
 """
 Pepper Robot Interface — NAOqi hardware control
-
-Changes from original:
-- self.connected flag — callers guard all hardware calls gracefully.
-- qi import is guarded — missing NAOqi loads fine, connect() returns False
-  and the system runs in offline/chat-only mode.
-- 5s connection timeout — unreachable IP falls through to offline mode
-  instead of hanging forever.
-- _hq_speech_animation_loop calls public gesture methods (not _impl directly)
-  so the gesture lock is always respected.
-- play_audio_file reuses one SSH connection for upload + cleanup.
-- ALMotion.move(x, y, theta) for movement — original continuous velocity
-  command, reverted from moveToward which was incorrect.
 """
 
 import os
@@ -48,10 +36,8 @@ class PepperRobot:
         self.ssh_user     = ssh_user
         self.ssh_password = ssh_password
 
-        # True only after successful connect()
         self.connected = False
 
-        # NAOqi services (set in connect())
         self.session         = None
         self.tts             = None
         self.motion          = None
@@ -128,38 +114,30 @@ class PepperRobot:
             except Exception as e:
                 print(f"   ⚠️  BasicAwareness: {e}")
 
-            # Disable collision protection for movement.
-            # Requires web interface permission first (http://ROBOT_IP → Settings).
-            # Fallback: set security distances to near-zero instead.
+            # Shrink collision security distances as much as possible
             try:
                 self.motion.setExternalCollisionProtectionEnabled("Move", False)
-                print("   ✅ Collision protection disabled (Move)")
+                print("   ✅ Collision protection disabled")
             except Exception:
                 try:
                     self.motion.setOrthogonalSecurityDistance(0.05)
                     self.motion.setTangentialSecurityDistance(0.05)
-                    print("   ✅ Collision security distances minimised (fallback)")
+                    print("   ✅ Collision security distances minimised")
                 except Exception as e2:
                     print(f"   ⚠️  Collision protection unchanged: {e2}")
 
-            # Explicitly set stiffness — wakeUp() sometimes misses this
+            # Ensure body stiffness is on
             try:
                 self.motion.setStiffnesses("Body", 1.0)
                 print("   ✅ Body stiffness set to 1.0")
             except Exception as e:
                 print(f"   ⚠️  Stiffness: {e}")
 
-            # Subscribe to MoveFailed so we can print why movement is blocked
+            # Max speaker volume on connect
             try:
-                mem = self.session.service("ALMemory")
-                mem.subscribeToEvent(
-                    "ALMotion/MoveFailed",
-                    "pepper_interface",
-                    "_on_move_failed",
-                )
-                print("   ✅ MoveFailed subscriber active")
+                self.audio.setOutputVolume(100)
             except Exception:
-                pass  # Non-critical diagnostic
+                pass
 
             self.motion.wakeUp()
             time.sleep(1)
@@ -171,15 +149,10 @@ class PepperRobot:
             print(f"❌ Service init failed: {e}")
             return False
 
-    def _on_move_failed(self, event_name, value, subscriber):
-        """Called by NAOqi when a move command is blocked."""
-        print(f"🚫 [MOV FAILED] NAOqi blocked movement: {value}")
-
     def disconnect(self):
         try:
             if self.motion:
                 self.motion.stopMove()
-                # Re-enable collision protection before handing back to Autonomous Life
                 try:
                     self.motion.setExternalCollisionProtectionEnabled("Move", True)
                 except Exception:
@@ -202,38 +175,6 @@ class PepperRobot:
             self.connected = False
 
     # ------------------------------------------------------------------
-    # Movement — moveToward() takes normalised velocity (-1.0 to 1.0)
-    # The movement_controller sends these continuously at ~10 Hz while a
-    # key is held, so NAOqi's internal watchdog doesn't kill the motion.
-    # ------------------------------------------------------------------
-
-    def move_forward(self,  speed: float = 0.6): self._move( speed,  0,  0)
-    def move_backward(self, speed: float = 0.6): self._move(-speed,  0,  0)
-    def turn_left(self,     speed: float = 0.5): self._move( 0,      0,  speed)
-    def turn_right(self,    speed: float = 0.5): self._move( 0,      0, -speed)
-    def strafe_left(self,   speed: float = 0.4): self._move( 0,  speed,  0)
-    def strafe_right(self,  speed: float = 0.4): self._move( 0, -speed,  0)
-
-    def stop_movement(self):
-        try:
-            self.motion.moveToward(0.0, 0.0, 0.0)
-            self.motion.stopMove()
-        except Exception as e:
-            print(f"❌ Stop error: {e}")
-
-    def _move(self, x: float, y: float, theta: float):
-        """
-        moveToward(x, y, theta) — normalised velocity, -1.0 to 1.0.
-        Non-blocking continuous command; robot keeps moving until
-        moveToward(0,0,0) or stopMove() is called.
-        """
-        try:
-            print(f"[MOV] moveToward({x:.2f}, {y:.2f}, {theta:.2f})")
-            self.motion.moveToward(x, y, theta)
-        except Exception as e:
-            print(f"❌ Move error: {e}")
-
-    # ------------------------------------------------------------------
     # Speech — built-in NAOqi TTS
     # ------------------------------------------------------------------
 
@@ -248,10 +189,15 @@ class PepperRobot:
                 print(f"❌ Speech error: {e}")
 
     def set_volume(self, volume: int):
+        """Set both TTS voice volume and speaker output volume (0–100)."""
         try:
             self.tts.setVolume(volume / 100.0)
         except Exception as e:
-            print(f"❌ Volume error: {e}")
+            print(f"❌ TTS volume error: {e}")
+        try:
+            self.audio.setOutputVolume(int(volume))
+        except Exception as e:
+            print(f"❌ Speaker volume error: {e}")
 
     # ------------------------------------------------------------------
     # Speech — HQ audio pipeline
@@ -527,26 +473,27 @@ class PepperRobot:
             print(f"❌ Bow error: {e}")
 
     # ------------------------------------------------------------------
-    # Movement
+    # Movement — moveToward() normalised velocity, -1.0 to 1.0.
+    # Called continuously at 10 Hz by movement_controller while key held.
     # ------------------------------------------------------------------
 
-    def move_forward(self,  speed: float = 0.5): self._move( speed,  0,  0)
-    def move_backward(self, speed: float = 0.5): self._move(-speed,  0,  0)
+    def move_forward(self,  speed: float = 0.6): self._move( speed,  0,  0)
+    def move_backward(self, speed: float = 0.6): self._move(-speed,  0,  0)
     def turn_left(self,     speed: float = 0.5): self._move( 0,      0,  speed)
     def turn_right(self,    speed: float = 0.5): self._move( 0,      0, -speed)
-    def strafe_left(self,   speed: float = 0.3): self._move( 0,  speed,  0)
-    def strafe_right(self,  speed: float = 0.3): self._move( 0, -speed,  0)
+    def strafe_left(self,   speed: float = 0.4): self._move( 0,  speed,  0)
+    def strafe_right(self,  speed: float = 0.4): self._move( 0, -speed,  0)
 
     def stop_movement(self):
         try:
+            self.motion.moveToward(0.0, 0.0, 0.0)
             self.motion.stopMove()
         except Exception as e:
             print(f"❌ Stop error: {e}")
 
-    def _move(self, x, y, theta):
+    def _move(self, x: float, y: float, theta: float):
         try:
-            print(f"[MOV] move({x:.2f}, {y:.2f}, {theta:.2f})")
-            self.motion.move(x, y, theta)
+            self.motion.moveToward(x, y, theta)
         except Exception as e:
             print(f"❌ Move error: {e}")
 
