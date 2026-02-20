@@ -203,9 +203,10 @@ class PepperRobot:
     # Speech — HQ audio pipeline
     # ------------------------------------------------------------------
 
-    def speak_hq(self, text: str, tts_handler: "HybridTTSHandler") -> bool:
+    def speak_hq(self, text: str, tts_handler: "HybridTTSHandler",
+                 emotion: Optional[str] = None) -> bool:
         try:
-            audio_path = tts_handler.speak(text)
+            audio_path = tts_handler.speak(text, emotion=emotion)
             if audio_path and self.play_audio_file(audio_path):
                 try:
                     os.remove(audio_path)

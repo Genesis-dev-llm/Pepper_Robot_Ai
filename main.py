@@ -47,6 +47,15 @@ def _pepper_ok() -> bool:
 
 # ── Volume callback ───────────────────────────────────────────────────────────
 
+def on_action(action: str):
+    """Called from GUI action buttons (e.g. Pulse Eyes)."""
+    if action == "pulse_eyes":
+        if _pepper_ok():
+            pepper.pulse_eyes("blue", duration=2.0)
+        else:
+            print("⚠️  Pepper not connected — can't pulse eyes")
+
+
 def on_volume_changed(volume: int):
     """Called from the GUI volume slider. Routes to Pepper hardware if connected."""
     if _pepper_ok():
@@ -55,9 +64,12 @@ def on_volume_changed(volume: int):
 
 # ── Function-call helpers ─────────────────────────────────────────────────────
 
-def execute_gestures(function_calls: list):
-    if not function_calls or not _pepper_ok():
-        return
+def execute_gestures(function_calls: list) -> Optional[str]:
+    """Execute gesture function calls. Returns detected emotion string or None."""
+    emotion = None
+    if not function_calls:
+        return emotion
+
     gesture_map = {
         "wave":               pepper.wave,
         "nod":                pepper.nod,
@@ -71,16 +83,23 @@ def execute_gestures(function_calls: list):
         "look_around":        pepper.look_around,
         "bow":                pepper.bow,
         "look_at_sound":      pepper.look_at_sound,
-    }
+    } if _pepper_ok() else {}
+
     for fn in function_calls:
         name = fn.get("name", "")
-        if name in gesture_map:
+        if name == "express_emotion":
+            emotion = fn.get("arguments", {}).get("emotion", None)
+        elif name == "web_search":
+            pass  # handled by execute_search
+        elif name in gesture_map:
             try:
                 gesture_map[name]()
             except Exception as e:
                 print(f"❌ Gesture '{name}' error: {e}")
-        elif name != "web_search":
+        else:
             print(f"⚠️  Unknown function: {name}")
+
+    return emotion
 
 
 def execute_search(function_calls: list) -> Optional[str]:
@@ -125,7 +144,10 @@ def handle_gui_message(message: str):
                 pepper.set_eye_color("white")
             if gui:
                 gui.update_status("Pepper is idle")
+                gui.set_robot_active(False)
             return
+
+        emotion = None   # set by execute_gestures if model calls express_emotion
 
         if gui:
             gui.update_status("Thinking…")
@@ -144,7 +166,7 @@ def handle_gui_message(message: str):
             if _pepper_ok():
                 pepper.thinking_indicator(start=False)
             _thinking_started = False
-            execute_gestures(function_calls)
+            emotion = execute_gestures(function_calls)
 
         else:
             response_text, function_calls = brain.chat(message)
@@ -160,17 +182,17 @@ def handle_gui_message(message: str):
                 if _pepper_ok():
                     pepper.thinking_indicator(start=False)
                 _thinking_started = False
-                execute_gestures(function_calls)
+                emotion = execute_gestures(function_calls)
             else:
                 if _pepper_ok():
                     pepper.thinking_indicator(start=False)
                 _thinking_started = False
-                execute_gestures(function_calls)
+                emotion = execute_gestures(function_calls)
 
         if response_text:
             if gui:
                 gui.add_pepper_message(response_text)
-            _say(response_text)
+            _say(response_text, emotion=emotion)
         else:
             fallback = "Sorry, I didn't catch that."
             if gui:
@@ -191,15 +213,15 @@ def handle_gui_message(message: str):
             gui.update_status("Ready")
 
 
-def _say(text: str):
+def _say(text: str, emotion: Optional[str] = None):
     if gui and gui.is_running:
         gui.update_status("🔊 Speaking…")
     try:
         if _pepper_ok():
-            pepper.speak_hq(text, tts)
+            pepper.speak_hq(text, tts, emotion=emotion)
         else:
             if tts:
-                tts.speak_and_play(text)
+                tts.speak_and_play(text, emotion=emotion)
     finally:
         if gui and gui.is_running:
             gui.update_status("Ready")
@@ -232,6 +254,7 @@ def on_press(key):
                 pepper.set_eye_color("blue" if state.robot_active else "white")
             if gui:
                 gui.update_status("Active — ready" if state.robot_active else "Idle")
+                gui.set_robot_active(state.robot_active)
             return
 
         if k is None:
@@ -340,14 +363,12 @@ def movement_controller():
                 continue
 
             if any_pressed:
-                if   movement_keys['w']: pepper.move_forward()
-                elif movement_keys['s']: pepper.move_backward()
-                elif movement_keys['a']: pepper.turn_left()
-                elif movement_keys['d']: pepper.turn_right()
-                elif movement_keys['q']: pepper.strafe_left()
-                elif movement_keys['e']: pepper.strafe_right()
+                # Additive axes — allows simultaneous W+A (forward+turn left) etc.
+                x     =  0.6 if movement_keys['w'] else -0.6 if movement_keys['s'] else 0.0
+                theta =  0.5 if movement_keys['a'] else -0.5 if movement_keys['d'] else 0.0
+                y     =  0.4 if movement_keys['q'] else -0.4 if movement_keys['e'] else 0.0
+                pepper._move(x, y, theta)
             elif prev_any:
-                # Transition: was moving, now stopped — send stop once
                 pepper.stop_movement()
 
             prev_any = any_pressed
@@ -490,7 +511,11 @@ def main():
 
     print_controls()
 
-    gui = PepperDearPyGUI(handle_gui_message, volume_callback=on_volume_changed)
+    gui = PepperDearPyGUI(
+        handle_gui_message,
+        volume_callback = on_volume_changed,
+        action_callback = on_action,
+    )
 
     if _pepper_ok():
         gui.update_status("Idle — press SPACE to activate Pepper")
@@ -507,6 +532,8 @@ def main():
         if gui:
             gui.stop()
         if pepper:
+            if pepper.connected:
+                pepper.set_volume(40)
             pepper.disconnect()
         print("\n👋 Goodbye!")
 

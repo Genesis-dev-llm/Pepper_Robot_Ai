@@ -13,9 +13,10 @@ MAX_CHAT_MESSAGES = 60
 
 
 class PepperDearPyGUI:
-    def __init__(self, message_callback, volume_callback=None):
+    def __init__(self, message_callback, volume_callback=None, action_callback=None):
         self.message_callback  = message_callback
-        self.volume_callback   = volume_callback   # fn(int 0–100) — wired to pepper.set_volume
+        self.volume_callback   = volume_callback   # fn(int 0–100)
+        self.action_callback   = action_callback   # fn(str action_name)
         self.is_running        = False
         self.message_queue     = queue.Queue()
         self.status_queue      = queue.Queue()
@@ -71,7 +72,10 @@ class PepperDearPyGUI:
             with dpg.group(horizontal=True):
                 dpg.add_text("🤖 Pepper AI Dashboard",
                              tag="header_text", color=(100, 149, 237))
-                dpg.add_spacer(width=20)
+                dpg.add_spacer(width=8)
+                # Active/idle dot — persistent, never overwritten by status updates
+                dpg.add_text("●", tag="active_dot", color=(120, 120, 120))
+                dpg.add_spacer(width=12)
                 dpg.add_text("Status: Starting…",
                              tag="status_text", color=(150, 150, 150))
 
@@ -118,7 +122,7 @@ class PepperDearPyGUI:
 
             dpg.add_separator()
 
-            # ── Volume slider ─────────────────────────────────────────
+            # ── Volume + quick actions ────────────────────────────────
             with dpg.group(horizontal=True):
                 dpg.add_text("🔊 Volume:", color=(200, 200, 200))
                 dpg.add_slider_int(
@@ -126,9 +130,15 @@ class PepperDearPyGUI:
                     default_value  = 100,
                     min_value      = 0,
                     max_value      = 100,
-                    width          = 300,
+                    width          = 240,
                     callback       = self._on_volume_changed,
                     format         = "%d%%",
+                )
+                dpg.add_spacer(width=16)
+                dpg.add_button(
+                    label    = "💡 Pulse Eyes",
+                    width    = 110,
+                    callback = lambda: self._on_action("pulse_eyes"),
                 )
 
             dpg.add_separator()
@@ -155,6 +165,26 @@ class PepperDearPyGUI:
 
     def _on_input_deactivated(self):
         self.text_input_focused = False
+
+    # ------------------------------------------------------------------
+    # Action callback
+    # ------------------------------------------------------------------
+
+    def _on_action(self, action: str):
+        if self.action_callback:
+            self.action_callback(action)
+
+    # ------------------------------------------------------------------
+    # Active/idle dot
+    # ------------------------------------------------------------------
+
+    def set_robot_active(self, active: bool):
+        """Update the persistent dot in the header. Green=active, red=idle."""
+        try:
+            color = (80, 200, 80) if active else (200, 60, 60)
+            dpg.configure_item("active_dot", color=color)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Volume callback

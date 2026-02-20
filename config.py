@@ -13,7 +13,7 @@ GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", None)
 
 # ===== PEPPER ROBOT SETTINGS =====
-PEPPER_IP       = os.getenv("PEPPER_IP", "10.55.203.146")
+PEPPER_IP       = os.getenv("PEPPER_IP", "10.51.200.219")
 PEPPER_PORT     = 9559
 PEPPER_SSH_USER = os.getenv("PEPPER_SSH_USER", "nao")
 PEPPER_SSH_PASS = os.getenv("PEPPER_SSH_PASS", "nao")
@@ -184,6 +184,28 @@ _GESTURE_FUNCTIONS = [
             "name": "look_at_sound",
             "description": "Make Pepper turn and look toward where sound is coming from",
             "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "express_emotion",
+            "description": (
+                "Set the emotional tone of Pepper's spoken voice. "
+                "Call this alongside your spoken response when the context "
+                "calls for a specific mood. Orpheus TTS will speak in that style."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "emotion": {
+                        "type": "string",
+                        "enum": ["happy", "sad", "excited", "curious", "surprised", "neutral"],
+                        "description": "The emotion to express in the voice"
+                    }
+                },
+                "required": ["emotion"]
+            }
         }
     },
 ]
