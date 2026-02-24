@@ -4,9 +4,11 @@ Hybrid TTS Handler — 3-Tier System
   Tier 2: Edge TTS             — unlimited, always available
   Tier 3: ElevenLabs           — rate-limited, last resort
 
-Tier order: Edge promoted to Tier 2 because it's unlimited and reliable.
-ElevenLabs demoted to Tier 3 — still available as a quality fallback but
-won't block if quota is hit.
+Each tier generates its own temp file with the correct suffix for that format.
+This avoids the fragile .replace(".wav", ".mp3") path derivation that broke
+silently if the base path had no .wav extension.
+
+Edge TTS uses asyncio.run() instead of manually managing an event loop.
 """
 
 import asyncio
@@ -85,8 +87,15 @@ class HybridTTSHandler:
     ) -> Optional[str]:
         """
         Generate speech via Groq → Edge TTS → ElevenLabs fallback chain.
-        Returns path to the generated audio file, or None on total failure.
+
+        Each tier creates its own temp file with the correct suffix for its
+        format (.wav for Groq, .mp3 for Edge and ElevenLabs). The output_file
+        parameter is kept for API compatibility but only used as the Groq target;
+        other tiers always generate their own paths.
+
+        Returns path to a valid, non-empty audio file, or None on total failure.
         """
+        # Groq writes WAV — use the provided path or make a fresh one
         if output_file is None:
             fd, output_file = tempfile.mkstemp(suffix=".wav")
             os.close(fd)
@@ -94,18 +103,29 @@ class HybridTTSHandler:
         # Tier 1 — Groq Orpheus
         if not self._groq_daily_limit_hit:
             if self._speak_groq(text, output_file, emotion):
-                return output_file
+                if self._valid_audio(output_file):
+                    return output_file
+                print("⚠️  Groq wrote empty/missing file — falling to Tier 2")
 
         # Tier 2 — Edge TTS (unlimited, always available)
-        edge_file = output_file.replace(".wav", ".mp3")
+        # Always creates its own .mp3 temp file — no path string manipulation.
+        fd, edge_file = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
         if self._speak_edge(text, edge_file):
-            return edge_file
+            if self._valid_audio(edge_file):
+                return edge_file
+            print("⚠️  Edge TTS wrote empty/missing file — falling to Tier 3")
+            self._cleanup(edge_file)
 
         # Tier 3 — ElevenLabs (last resort)
         if self.elevenlabs_enabled and not self._elevenlabs_daily_limit_hit:
-            el_file = output_file.replace(".wav", "_el.mp3")
+            fd, el_file = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
             if self._speak_elevenlabs(text, el_file):
-                return el_file
+                if self._valid_audio(el_file):
+                    return el_file
+                print("⚠️  ElevenLabs wrote empty/missing file")
+                self._cleanup(el_file)
 
         return None
 
@@ -137,10 +157,7 @@ class HybridTTSHandler:
         if not path:
             return False
         self.play_audio(path)
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        self._cleanup(path)
         return True
 
     def reset_daily_limits(self):
@@ -215,13 +232,39 @@ class HybridTTSHandler:
             return False
 
     def _speak_edge(self, text: str, output_file: str) -> bool:
-        loop = asyncio.new_event_loop()
+        """
+        Run the async Edge TTS call using asyncio.run().
+
+        asyncio.run() creates a fresh event loop, runs the coroutine to
+        completion, then closes the loop cleanly — replacing the previous
+        manual new_event_loop / set_event_loop / close pattern which had
+        unnecessary overhead and left the thread's event loop in a None state.
+        """
         try:
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(self._speak_edge_async(text, output_file))
-        finally:
-            loop.close()
-            asyncio.set_event_loop(None)
+            return asyncio.run(self._speak_edge_async(text, output_file))
+        except Exception as e:
+            print(f"❌ Edge TTS runner error: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _valid_audio(path: str) -> bool:
+        """Return True if path exists and is a non-empty file."""
+        try:
+            return os.path.exists(path) and os.path.getsize(path) > 0
+        except OSError:
+            return False
+
+    @staticmethod
+    def _cleanup(path: str):
+        """Remove a temp file, ignoring errors."""
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 # Backward-compat alias

@@ -20,7 +20,7 @@ PEPPER_SSH_PASS = os.getenv("PEPPER_SSH_PASS", "nao")
 
 # ===== GROQ MODEL SETTINGS =====
 GROQ_LLM_MODEL      = "llama-3.3-70b-versatile"
-GROQ_COMPOUND_MODEL = "groq/compound"
+GROQ_COMPOUND_MODEL = "compound-beta"   # Groq's compound model with built-in web search
 GROQ_WHISPER_MODEL  = "whisper-large-v3-turbo"
 
 # ===== WEB SEARCH =====
@@ -64,7 +64,13 @@ SEARCH_KEYWORDS = {
 }
 
 # ===== SYSTEM PROMPT =====
-def _build_system_prompt() -> str:
+def build_system_prompt() -> str:
+    """
+    Build the system prompt with today's date.
+
+    Called at startup in main() rather than at import time, so the date
+    is always correct even if the process has been running since yesterday.
+    """
     today_str = date.today().strftime("%B %d, %Y")
     web_search_line = (
         "You can search the web — use it when someone asks about recent events, prices, news, anything current."
@@ -83,7 +89,11 @@ You've got gestures — wave, nod, shrug, shake_head, look_around, thinking_gest
 
 Knowledge cutoff is early 2025. No financial, medical, or legal advice — say so once and move on. Make it interesting."""
 
-SYSTEM_PROMPT = _build_system_prompt()
+
+# Legacy alias kept so any code that directly reads config.SYSTEM_PROMPT
+# at import time still gets something reasonable (today's date at import).
+# main() should call config.build_system_prompt() directly at startup.
+SYSTEM_PROMPT = build_system_prompt()
 
 # ===== AVAILABLE ROBOT FUNCTIONS =====
 # web_search is only included when USE_WEB_SEARCH is True — if it's in the

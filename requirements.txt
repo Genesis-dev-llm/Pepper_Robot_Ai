@@ -14,7 +14,9 @@ elevenlabs>=0.2.0  # ElevenLabs TTS (optional, best quality)
 pynput>=1.7.6  # Keyboard/mouse input handling
 
 # GUI (DearPyGUI - GPU-accelerated, perfect for video streaming)
-dearpygui>=1.10.0  # Modern, fast GUI framework
+# 1.10.0+ required. 1.11.0+ enables OS-level drag & drop onto the window.
+# On older versions the Load Image button is used instead (automatic fallback).
+dearpygui>=1.10.0
 
 # Web Search (DuckDuckGo - Free, unlimited)
 duckduckgo-search>=4.0.0  # Free web search API
@@ -26,3 +28,11 @@ numpy>=1.24.0              # Audio array manipulation
 
 # Environment Variables
 python-dotenv>=1.0.0      # Auto-load .env files
+
+# SSH / SFTP — required for HQ audio transfer to Pepper
+# Without this, speak_hq() falls back to Pepper's robotic built-in TTS voice.
+paramiko>=2.11.0
+
+# Tablet display — image processing for Pepper's chest tablet
+# Used by pepper_display.py to resize/letterbox/sharpen images.
+Pillow>=10.0.0

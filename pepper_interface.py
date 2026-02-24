@@ -2,10 +2,12 @@
 Pepper Robot Interface — NAOqi hardware control
 """
 
+import logging
 import os
 import random
 import threading
 import time
+from contextlib import contextmanager
 from typing import Optional, TYPE_CHECKING
 
 try:
@@ -45,6 +47,7 @@ class PepperRobot:
         self.audio           = None
         self.leds            = None
         self.awareness       = None
+        self.tablet          = None   # ALTabletService — None if unavailable
 
         self._speech_lock  = threading.Lock()
         self._gesture_lock = threading.Lock()
@@ -52,6 +55,19 @@ class PepperRobot:
         self._thinking        = False
         self._thinking_thread: Optional[threading.Thread] = None
         self._is_speaking_hq  = False
+
+        # Persistent SSH connection for HQ audio transfer.
+        # Kept alive across utterances — only reconnects when the transport
+        # drops. Saves ~1-2s per response vs opening a new connection each time.
+        self._ssh_client: Optional["paramiko.SSHClient"] = None
+
+        # --- Gesture cooldown ---
+        # Tracks when any gesture last fired so the background animation loop
+        # doesn't spam conflicting setAngles commands mid-motion.
+        # AI-triggered gestures bypass this (they're intentional) but update
+        # the timestamp, which makes the loop back off after they fire.
+        self._last_gesture_time: float = 0.0
+        self._GESTURE_COOLDOWN: float  = 2.5   # seconds
 
     # ------------------------------------------------------------------
     # Connection
@@ -82,9 +98,10 @@ class PepperRobot:
 
         if not _result["success"]:
             if t.is_alive():
-                print(f"⏱️  Connection timed out after {timeout}s — launching in offline mode")
+                logging.warning("Connection timed out after %.1fs — launching in offline mode", timeout)
             else:
-                print(f"❌ Connection failed: {_result['error']} — launching in offline mode")
+                logging.error("Connection failed: %s — launching in offline mode",
+                              _result['error'])
             print("   Chat, TTS and web search will still work.")
             print("   Robot controls and gestures will be silently ignored.")
             self.connected = False
@@ -98,6 +115,16 @@ class PepperRobot:
             self.audio           = self.session.service("ALAudioDevice")
             self.leds            = self.session.service("ALLeds")
             self.awareness       = self.session.service("ALBasicAwareness")
+
+            # ALTabletService is available on Pepper 1.8+ but not all firmware
+            # versions expose it. Catch the error gracefully so the rest of
+            # the system works fine even without tablet support.
+            try:
+                self.tablet = self.session.service("ALTabletService")
+                print("   ✅ Tablet service available")
+            except Exception:
+                self.tablet = None
+                print("   ⚠️  ALTabletService not available — tablet display disabled")
 
             # Disable Autonomous Life — fights direct motion commands
             try:
@@ -146,7 +173,7 @@ class PepperRobot:
             return True
         except Exception as e:
             self.connected = False
-            print(f"❌ Service init failed: {e}")
+            logging.error("Service init failed: %s", e)
             return False
 
     def disconnect(self):
@@ -170,9 +197,15 @@ class PepperRobot:
                 pass
             print("👋 Disconnected from Pepper")
         except Exception as e:
-            print(f"⚠️  Disconnect error: {e}")
+            logging.warning("Disconnect error: %s", e)
         finally:
             self.connected = False
+            if self._ssh_client:
+                try:
+                    self._ssh_client.close()
+                except Exception:
+                    pass
+                self._ssh_client = None
 
     # ------------------------------------------------------------------
     # Speech — built-in NAOqi TTS
@@ -186,18 +219,18 @@ class PepperRobot:
                 else:
                     self.tts.say(text)
             except Exception as e:
-                print(f"❌ Speech error: {e}")
+                logging.error("Speech error: %s", e)
 
     def set_volume(self, volume: int):
         """Set both TTS voice volume and speaker output volume (0–100)."""
         try:
             self.tts.setVolume(volume / 100.0)
         except Exception as e:
-            print(f"❌ TTS volume error: {e}")
+            logging.error("TTS volume error: %s", e)
         try:
             self.audio.setOutputVolume(int(volume))
         except Exception as e:
-            print(f"❌ Speaker volume error: {e}")
+            logging.error("Speaker volume error: %s", e)
 
     # ------------------------------------------------------------------
     # Speech — HQ audio pipeline
@@ -214,13 +247,59 @@ class PepperRobot:
                     pass
                 return True
         except Exception as e:
-            print(f"⚠️  HQ TTS pipeline error: {e}")
+            logging.warning("HQ TTS pipeline error: %s", e)
 
         print("↩️  Falling back to built-in NAOqi TTS")
         self.speak(text)
         return False
 
+    def _ensure_ssh(self) -> bool:
+        """
+        Ensure the persistent SSH connection to Pepper is alive.
+
+        Checks the underlying transport before attempting to reconnect, so
+        healthy connections pay only a cheap attribute lookup per call.
+        Called inside play_audio_file which already holds _speech_lock,
+        so no additional locking is needed here.
+        """
+        if not _PARAMIKO_AVAILABLE:
+            return False
+        try:
+            transport = self._ssh_client.get_transport() if self._ssh_client else None
+            if transport and transport.is_active():
+                return True
+        except Exception:
+            pass
+
+        # Transport is dead or never opened — (re)connect.
+        print("🔗 (Re)connecting SSH to Pepper…")
+        try:
+            if self._ssh_client:
+                try:
+                    self._ssh_client.close()
+                except Exception:
+                    pass
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(self.ip, username=self.ssh_user,
+                           password=self.ssh_password, timeout=5)
+            self._ssh_client = client
+            print("   ✅ SSH connected")
+            return True
+        except Exception as e:
+            print(f"   ❌ SSH connection failed: {e}")
+            self._ssh_client = None
+            return False
+
     def play_audio_file(self, file_path: str, lock_timeout: float = 0.5) -> bool:
+        """
+        Transfer an audio file to Pepper via SFTP and play it through ALAudioPlayer.
+
+        Uses a persistent SSH connection — the TCP handshake only happens once
+        per session (or after a network drop), not on every utterance.
+        The SFTP channel is opened fresh per transfer; it's cheap once the
+        transport is already established.
+        """
         if not _PARAMIKO_AVAILABLE:
             print("⚠️  paramiko unavailable — cannot transfer audio to robot")
             return False
@@ -231,13 +310,12 @@ class PepperRobot:
             return False
 
         remote_path = f"/tmp/{os.path.basename(file_path)}"
-        ssh = None
         try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(self.ip, username=self.ssh_user,
-                        password=self.ssh_password, timeout=5)
-            sftp = ssh.open_sftp()
+            if not self._ensure_ssh():
+                return False
+
+            # Open a fresh SFTP channel on the existing transport.
+            sftp = self._ssh_client.open_sftp()
             sftp.put(file_path, remote_path)
             sftp.close()
 
@@ -251,47 +329,72 @@ class PepperRobot:
             ).start()
 
             player.play(file_id)
-            self._is_speaking_hq = False
-
-            try:
-                ssh.exec_command(f"rm -f {remote_path}")
-            except Exception:
-                pass
-
-            return True
 
         except Exception as e:
-            self._is_speaking_hq = False
-            print(f"⚠️  ALAudioPlayer failed: {e}")
+            logging.warning("ALAudioPlayer failed: %s", e)
             return False
         finally:
-            if ssh:
+            # Always clear flag and release lock — even on exception.
+            # SSH stays open; only clean up the remote temp file.
+            self._is_speaking_hq = False
+            if self._ssh_client:
                 try:
-                    ssh.close()
+                    self._ssh_client.exec_command(f"rm -f {remote_path}")
                 except Exception:
                     pass
             self._speech_lock.release()
 
+        return True
+
     def _hq_speech_animation_loop(self):
+        """
+        Fires random background gestures during HQ audio playback.
+
+        Respects _GESTURE_COOLDOWN — if an AI-triggered gesture fired recently
+        (or another background gesture is still running), this loop backs off
+        instead of sending conflicting setAngles commands mid-motion.
+        Movement (base/wheels) is completely independent and never blocked here.
+        """
         gesture_fns = [self.nod, self.explaining_gesture,
                        self.thinking_gesture, self.look_around]
         while self._is_speaking_hq:
             try:
                 self.set_eye_color("blue")
-                if random.random() > 0.6:
+                # Only attempt a gesture if enough time has passed since the
+                # last one — prevents arm jerk from overlapping commands.
+                if (random.random() > 0.6 and
+                        time.time() - self._last_gesture_time >= self._GESTURE_COOLDOWN):
                     random.choice(gesture_fns)()
                 for _ in range(20):
                     if not self._is_speaking_hq:
                         break
                     time.sleep(0.1)
             except Exception as e:
-                print(f"⚠️  HQ anim loop error: {e}")
+                logging.warning("HQ anim loop error: %s", e)
                 break
         self.set_eye_color("blue")
 
     # ------------------------------------------------------------------
-    # Thinking indicator
+    # Thinking indicator + context manager
     # ------------------------------------------------------------------
+
+    @contextmanager
+    def thinking(self):
+        """
+        Context manager for the thinking indicator.
+
+            with pepper.thinking():
+                response = brain.chat(message)   # eyes pulse while thinking
+            # eyes stop automatically here, even if an exception was raised
+
+        Replaces the old start=True / start=False pair and the fragile
+        _thinking_started flag in main.py.
+        """
+        self.thinking_indicator(start=True)
+        try:
+            yield
+        finally:
+            self.thinking_indicator(start=False)
 
     def thinking_indicator(self, start: bool = True):
         if start:
@@ -325,10 +428,19 @@ class PepperRobot:
     # ------------------------------------------------------------------
 
     def _run_gesture(self, impl_fn, *args, **kwargs):
+        """
+        Spawns a daemon thread to run a gesture non-blocking.
+        Records the start time so the animation loop can respect the cooldown.
+        The gesture lock prevents two gestures running simultaneously on the arms.
+        Base movement is on a completely separate motion API and is unaffected.
+        """
         def _worker():
             if not self._gesture_lock.acquire(blocking=False):
                 return
             try:
+                # Stamp the time before executing so the animation loop
+                # immediately backs off, not just after the physical move ends.
+                self._last_gesture_time = time.time()
                 impl_fn(*args, **kwargs)
             finally:
                 self._gesture_lock.release()
@@ -363,7 +475,7 @@ class PepperRobot:
                 self.motion.setAngles(names, up,   0.3); time.sleep(0.2)
             self.motion.setAngles(names, rest, 0.2)
         except Exception as e:
-            print(f"❌ Wave error: {e}")
+            logging.error("Wave error: %s", e)
 
     def _nod_impl(self):
         try:
@@ -371,7 +483,7 @@ class PepperRobot:
             self.motion.setAngles("HeadPitch", -0.1, 0.15); time.sleep(0.3)
             self.motion.setAngles("HeadPitch",  0.0, 0.15)
         except Exception as e:
-            print(f"❌ Nod error: {e}")
+            logging.error("Nod error: %s", e)
 
     def _shake_head_impl(self):
         try:
@@ -379,14 +491,14 @@ class PepperRobot:
             self.motion.setAngles("HeadYaw", -0.4, 0.15); time.sleep(0.3)
             self.motion.setAngles("HeadYaw",  0.0, 0.15)
         except Exception as e:
-            print(f"❌ Shake head error: {e}")
+            logging.error("Shake head error: %s", e)
 
     def _look_at_sound_impl(self):
         try:
             if self.awareness:
                 self.awareness.setEnabled(True)
         except Exception as e:
-            print(f"❌ Look at sound error: {e}")
+            logging.error("Look at sound error: %s", e)
 
     def _thinking_gesture_impl(self):
         try:
@@ -396,7 +508,7 @@ class PepperRobot:
             self.motion.setAngles(names, pose, 0.15); time.sleep(1.0)
             self.motion.setAngles(names, rest, 0.15)
         except Exception as e:
-            print(f"❌ Thinking gesture error: {e}")
+            logging.error("Thinking gesture error: %s", e)
 
     def _explaining_gesture_impl(self):
         try:
@@ -409,7 +521,7 @@ class PepperRobot:
             self.motion.setAngles(names, close, 0.2); time.sleep(0.4)
             self.motion.setAngles(names, rest,  0.2)
         except Exception as e:
-            print(f"❌ Explaining gesture error: {e}")
+            logging.error("Explaining gesture error: %s", e)
 
     def _excited_gesture_impl(self):
         try:
@@ -420,7 +532,7 @@ class PepperRobot:
             self.motion.setAngles(names, up,   0.15); time.sleep(0.8)
             self.motion.setAngles(names, rest, 0.15)
         except Exception as e:
-            print(f"❌ Excited gesture error: {e}")
+            logging.error("Excited gesture error: %s", e)
 
     def _point_forward_impl(self):
         try:
@@ -430,7 +542,7 @@ class PepperRobot:
             self.motion.setAngles(names, point, 0.15); time.sleep(1.0)
             self.motion.setAngles(names, rest,  0.15)
         except Exception as e:
-            print(f"❌ Point error: {e}")
+            logging.error("Point error: %s", e)
 
     def _shrug_impl(self):
         try:
@@ -442,7 +554,7 @@ class PepperRobot:
             self.motion.setAngles(names, pose, 0.15); time.sleep(0.8)
             self.motion.setAngles(names, rest, 0.15)
         except Exception as e:
-            print(f"❌ Shrug error: {e}")
+            logging.error("Shrug error: %s", e)
 
     def _celebrate_impl(self):
         try:
@@ -456,7 +568,7 @@ class PepperRobot:
                 self.motion.setAngles(names, down, 0.25); time.sleep(0.3)
             self.motion.setAngles(names, rest, 0.2)
         except Exception as e:
-            print(f"❌ Celebrate error: {e}")
+            logging.error("Celebrate error: %s", e)
 
     def _look_around_impl(self):
         try:
@@ -464,18 +576,20 @@ class PepperRobot:
             self.motion.setAngles("HeadYaw",  0.5, 0.15); time.sleep(0.5)
             self.motion.setAngles("HeadYaw",  0.0, 0.15)
         except Exception as e:
-            print(f"❌ Look around error: {e}")
+            logging.error("Look around error: %s", e)
 
     def _bow_impl(self):
         try:
             self.motion.setAngles("HeadPitch", 0.5, 0.1); time.sleep(0.5)
             self.motion.setAngles("HeadPitch", 0.0, 0.1); time.sleep(0.3)
         except Exception as e:
-            print(f"❌ Bow error: {e}")
+            logging.error("Bow error: %s", e)
 
     # ------------------------------------------------------------------
     # Movement — moveToward() normalised velocity, -1.0 to 1.0.
-    # Called continuously at 10 Hz by movement_controller while key held.
+    # Called continuously at 20 Hz by movement_controller while key held.
+    # Completely independent of gesture lock — arms and base move freely
+    # at the same time.
     # ------------------------------------------------------------------
 
     def move_forward(self,  speed: float = 0.6): self._move( speed,  0,  0)
@@ -490,13 +604,13 @@ class PepperRobot:
             self.motion.moveToward(0.0, 0.0, 0.0)
             self.motion.stopMove()
         except Exception as e:
-            print(f"❌ Stop error: {e}")
+            logging.error("Stop error: %s", e)
 
     def _move(self, x: float, y: float, theta: float):
         try:
             self.motion.moveToward(x, y, theta)
         except Exception as e:
-            print(f"❌ Move error: {e}")
+            logging.error("Move error: %s", e)
 
     # ------------------------------------------------------------------
     # LEDs
@@ -511,13 +625,25 @@ class PepperRobot:
         "off":    0x00000000,
     }
 
+    # Maps emotion strings (from express_emotion function calls) to eye colours.
+    # Eyes are set before Pepper starts speaking so the colour is visible while
+    # she talks. The _hq_speech_animation_loop reverts to blue after speaking.
+    EMOTION_COLOUR_MAP = {
+        "happy":     "yellow",
+        "sad":       "blue",
+        "excited":   "green",
+        "curious":   "blue",
+        "surprised": "white",
+        "neutral":   "blue",
+    }
+
     def set_eye_color(self, color: str):
         try:
             rgb = self._COLOUR_MAP.get(color)
             if rgb is not None:
                 self.leds.fadeRGB("FaceLeds", rgb, 0.5)
         except Exception as e:
-            print(f"❌ LED error: {e}")
+            logging.error("LED error: %s", e)
 
     def pulse_eyes(self, color: str = "blue", duration: float = 2.0):
         try:
@@ -527,4 +653,34 @@ class PepperRobot:
             time.sleep(0.2)
             self.set_eye_color(color)
         except Exception as e:
-            print(f"❌ Pulse error: {e}")
+            logging.error("Pulse error: %s", e)
+
+    # ------------------------------------------------------------------
+    # Tablet display
+    # ------------------------------------------------------------------
+
+    def show_tablet_image(self, url: str):
+        """
+        Tell Pepper's tablet to display the image at the given URL.
+
+        The URL must be reachable from the tablet's Android browser on the
+        local network — i.e. served by PepperDisplayManager's HTTP server.
+        This is a one-shot call; the image persists on the tablet until
+        clear_tablet() is called or the tablet is woken/reset.
+        """
+        if not self.tablet:
+            logging.warning("show_tablet_image: ALTabletService not available")
+            return
+        try:
+            self.tablet.showImage(url)
+        except Exception as e:
+            logging.warning("show_tablet_image failed: %s", e)
+
+    def clear_tablet(self):
+        """Hide any displayed image and return the tablet to its default state."""
+        if not self.tablet:
+            return
+        try:
+            self.tablet.hideImage()
+        except Exception as e:
+            logging.warning("clear_tablet failed: %s", e)

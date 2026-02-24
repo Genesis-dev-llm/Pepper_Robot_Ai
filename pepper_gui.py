@@ -2,6 +2,7 @@
 DearPyGUI Interface for Pepper AI Chat
 """
 
+import os
 import queue
 import threading
 import time
@@ -13,21 +14,49 @@ MAX_CHAT_MESSAGES = 60
 
 
 class PepperDearPyGUI:
-    def __init__(self, message_callback, volume_callback=None, action_callback=None):
-        self.message_callback  = message_callback
-        self.volume_callback   = volume_callback   # fn(int 0–100)
-        self.action_callback   = action_callback   # fn(str action_name)
-        self.is_running        = False
-        self.message_queue     = queue.Queue()
-        self.status_queue      = queue.Queue()
+    def __init__(self, message_callback, volume_callback=None, action_callback=None,
+                 display_callback=None, clear_display_callback=None):
+        self.message_callback       = message_callback
+        self.volume_callback        = volume_callback          # fn(int 0–100)
+        self.action_callback        = action_callback          # fn(str action_name)
+        self.display_callback       = display_callback         # fn(path, sharpen: bool)
+        self.clear_display_callback = clear_display_callback   # fn()
+        self.is_running             = False
+        self.message_queue          = queue.Queue()
+        self.status_queue           = queue.Queue()
 
-        # Written only from DPG callbacks (main thread) — read from pynput thread.
-        # No lock needed: bool assignment is atomic in CPython.
-        self.text_input_focused = False
+        # threading.Event is explicitly thread-safe for cross-thread reads.
+        # Written by DearPyGUI's main thread (activated/deactivated callbacks).
+        # Read by the pynput listener thread on every keypress.
+        # .is_set() is a proper memory barrier — no stale-read risk.
+        self._input_focused_event = threading.Event()
+
+        # Cached status before entering text mode so we can restore it on exit.
+        self._pre_focus_status: str = "Ready"
 
         self._msg_tag_counter      = 0
         self._msg_tags: list       = []
         self._scroll_pending: bool = False
+
+        # Volume debounce — avoids spamming NAOqi on every pixel of slider drag.
+        # At 150ms debounce the user can still scrub smoothly (~7 calls/s max).
+        self._volume_last_sent:  float = 0.0
+        self._VOLUME_DEBOUNCE:   float = 0.15   # seconds
+
+    # ------------------------------------------------------------------
+    # text_input_focused — property backed by threading.Event
+    # ------------------------------------------------------------------
+
+    @property
+    def text_input_focused(self) -> bool:
+        """
+        True while the text input box has keyboard focus.
+
+        Backed by a threading.Event so reads from the pynput listener thread
+        are properly synchronised with writes from the DearPyGUI main thread.
+        Exposed as a bool property so all callers (main.py etc.) are unchanged.
+        """
+        return self._input_focused_event.is_set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -46,6 +75,26 @@ class PepperDearPyGUI:
         )
         dpg.setup_dearpygui()
         dpg.show_viewport()
+
+        # Register OS-level file drop — available in DearPyGUI 1.11+.
+        # Gracefully skipped on older versions so the button still works.
+        self._drop_supported = False
+        try:
+            dpg.set_viewport_drop_callback(self._on_file_drop)
+            self._drop_supported = True
+        except AttributeError:
+            pass  # Older DPG version — drag-drop unavailable, button still works
+
+        # Update the drag-drop hint text now that we know if it's supported
+        try:
+            if self._drop_supported:
+                dpg.configure_item("display_drag_hint",
+                                   default_value="💡 Or drag & drop an image anywhere onto this window")
+            else:
+                dpg.configure_item("display_drag_hint",
+                                   default_value="💡 Drag & drop not available — use the Load Image button")
+        except Exception:
+            pass
 
         while dpg.is_dearpygui_running() and self.is_running:
             self._process_queues()
@@ -73,8 +122,11 @@ class PepperDearPyGUI:
                 dpg.add_text("🤖 Pepper AI Dashboard",
                              tag="header_text", color=(100, 149, 237))
                 dpg.add_spacer(width=8)
-                # Active/idle dot — persistent, never overwritten by status updates
+                # Active/idle dot — green=active, red=idle, never overwritten by status
                 dpg.add_text("●", tag="active_dot", color=(120, 120, 120))
+                dpg.add_spacer(width=4)
+                # Connection dot — cyan=connected, grey=offline, set once on connect/disconnect
+                dpg.add_text("●", tag="connection_dot", color=(120, 120, 120))
                 dpg.add_spacer(width=12)
                 dpg.add_text("Status: Starting…",
                              tag="status_text", color=(150, 150, 150))
@@ -150,6 +202,43 @@ class PepperDearPyGUI:
                 dpg.add_text(" WASD=Move",  color=(100, 200, 100))
                 dpg.add_text(" 1-9=Gesture", color=(100, 200, 100))
 
+            dpg.add_separator()
+
+            # ── Tablet display ────────────────────────────────────────
+            with dpg.collapsing_header(label="🖼️ Tablet Display", default_open=False):
+                dpg.add_text(
+                    "Send an image to Pepper's chest tablet.",
+                    color=(180, 180, 180)
+                )
+                dpg.add_spacer(height=4)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(
+                        label    = "📂 Load Image",
+                        width    = 120,
+                        callback = self._open_image_dialog,
+                    )
+                    dpg.add_button(
+                        label    = "🗑️ Clear Display",
+                        width    = 120,
+                        callback = self._on_clear_display,
+                    )
+                    dpg.add_spacer(width=12)
+                    dpg.add_checkbox(
+                        label        = "Sharpen (logos/icons)",
+                        tag          = "display_sharpen_checkbox",
+                        default_value= False,
+                    )
+                dpg.add_spacer(height=4)
+                # Drag-drop target hint — updated in start() once we know if it's supported
+                dpg.add_text(
+                    "💡 Checking drag & drop support…",
+                    tag   = "display_drag_hint",
+                    color = (120, 120, 120)
+                )
+                dpg.add_spacer(height=2)
+                dpg.add_text("No image loaded", tag="display_status_text",
+                             color=(150, 150, 150))
+
         dpg.set_primary_window("main_window", True)
 
         self._add_system_message("🤖 Pepper AI Control Dashboard started")
@@ -157,14 +246,117 @@ class PepperDearPyGUI:
         self._add_system_message("Press SPACE (outside input box) to wake Pepper")
 
     # ------------------------------------------------------------------
-    # Keyboard gate callbacks
+    # Tablet display callbacks
     # ------------------------------------------------------------------
 
+    def _on_file_drop(self, sender, app_data):
+        """
+        Called by DearPyGUI when one or more files are dragged onto the window.
+
+        app_data is a list of dropped file paths. We take the first image file
+        found (by extension) and treat it exactly like a file-dialog selection.
+        Non-image files are silently ignored so accidentally dropping a .txt
+        or folder doesn't do anything unexpected.
+        """
+        IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}
+        for path in app_data:
+            ext = os.path.splitext(path)[1].lower()
+            if ext in IMAGE_EXTS and os.path.isfile(path):
+                # Reuse the existing selection handler — same processing pipeline
+                self._on_image_selected(sender, {"file_path_name": path})
+                return
+
+    def _open_image_dialog(self):
+        """Open DearPyGUI's built-in file dialog filtered to image types."""
+        # Delete any existing dialog first — clicking Load Image twice
+        # would otherwise throw a duplicate-tag error from DPG.
+        try:
+            dpg.delete_item("image_file_dialog")
+        except Exception:
+            pass
+
+        dpg.add_file_dialog(
+            label            = "Select Image for Pepper's Tablet",
+            default_path     = os.path.expanduser("~"),
+            callback         = self._on_image_selected,
+            cancel_callback  = lambda s, a: None,
+            width            = 700,
+            height           = 450,
+            modal            = True,
+            tag              = "image_file_dialog",
+            file_count       = 1,
+        )
+        dpg.add_file_extension(".png",  parent="image_file_dialog", color=(100, 220, 100))
+        dpg.add_file_extension(".jpg",  parent="image_file_dialog", color=(100, 220, 100))
+        dpg.add_file_extension(".jpeg", parent="image_file_dialog", color=(100, 220, 100))
+        dpg.add_file_extension(".bmp",  parent="image_file_dialog", color=(100, 220, 100))
+        dpg.add_file_extension(".webp", parent="image_file_dialog", color=(100, 220, 100))
+        dpg.add_file_extension(".gif",  parent="image_file_dialog", color=(100, 220, 100))
+
+    def _on_image_selected(self, sender, app_data):
+        """Called by DPG when the user confirms a file selection."""
+        path = app_data.get("file_path_name", "")
+        if not path or not os.path.isfile(path):
+            return
+        sharpen = dpg.get_value("display_sharpen_checkbox")
+        filename = os.path.basename(path)
+        try:
+            dpg.set_value("display_status_text",
+                          f"⏳ Processing: {filename}…")
+        except Exception:
+            pass
+        if self.display_callback:
+            self.display_callback(path, sharpen)
+        # Update status after callback is fired (callback runs worker thread,
+        # so "Sent" appears immediately while processing continues in background)
+        try:
+            dpg.set_value("display_status_text",
+                          f"✅ Sent: {filename}")
+        except Exception:
+            pass
+
+    def _on_clear_display(self):
+        """Called when the user clicks Clear Display."""
+        if self.clear_display_callback:
+            self.clear_display_callback()
+        try:
+            dpg.set_value("display_status_text", "No image loaded")
+        except Exception:
+            pass
+
     def _on_input_activated(self):
-        self.text_input_focused = True
+        """
+        Called by DearPyGUI when the text input receives focus.
+
+        Sets the event so the pynput thread stops routing keypresses to
+        robot controls, and updates the status bar so the user knows they're
+        in text-input mode rather than wondering why WASD isn't working.
+        """
+        self._input_focused_event.set()
+        # Cache whatever the status was before entering text mode so we can
+        # restore it cleanly when the user finishes typing.
+        try:
+            current = dpg.get_value("status_text")
+            self._pre_focus_status = current.replace("Status: ", "", 1)
+        except Exception:
+            self._pre_focus_status = "Ready"
+        try:
+            dpg.set_value("status_text", "Status: ✏️ Text mode — robot controls paused")
+        except Exception:
+            pass
 
     def _on_input_deactivated(self):
-        self.text_input_focused = False
+        """
+        Called by DearPyGUI when the text input loses focus.
+
+        Clears the event and restores the previous status so the user
+        can see robot controls are active again.
+        """
+        self._input_focused_event.clear()
+        try:
+            dpg.set_value("status_text", f"Status: {self._pre_focus_status}")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Action callback
@@ -186,11 +378,35 @@ class PepperDearPyGUI:
         except Exception:
             pass
 
+    def set_connection_status(self, connected: bool):
+        """
+        Update the connection dot in the header.
+
+        Cyan = connected to Pepper hardware.
+        Grey = offline / not reachable.
+
+        Thread-safe — queued so it can be called before the DPG render loop
+        starts (e.g. right after pepper.connect() during initialisation).
+        """
+        self.message_queue.put(("connection_status", connected))
+
     # ------------------------------------------------------------------
     # Volume callback
     # ------------------------------------------------------------------
 
     def _on_volume_changed(self, sender, app_data):
+        """
+        Debounced volume callback — fires at most every 150ms while dragging.
+
+        Without debouncing, sliding from 0→100 fires ~100 consecutive NAOqi
+        calls (setVolume + setOutputVolume each), which stacks up and causes
+        audio glitches. At 150ms we cap it at ~7 calls/s which feels responsive
+        but doesn't overload the NAOqi service.
+        """
+        now = time.time()
+        if now - self._volume_last_sent < self._VOLUME_DEBOUNCE:
+            return
+        self._volume_last_sent = now
         if self.volume_callback:
             self.volume_callback(int(app_data))
 
@@ -298,6 +514,12 @@ class PepperDearPyGUI:
                     ).start()
                 elif kind == "recording_state":
                     self._set_recording_internal(data)
+                elif kind == "connection_status":
+                    try:
+                        color = (0, 200, 200) if data else (120, 120, 120)
+                        dpg.configure_item("connection_dot", color=color)
+                    except Exception:
+                        pass
             except queue.Empty:
                 break
 
@@ -308,10 +530,12 @@ class PepperDearPyGUI:
             except queue.Empty:
                 break
         if last_status is not None:
-            try:
-                dpg.set_value("status_text", f"Status: {last_status}")
-            except Exception:
-                pass
+            # Don't overwrite the text-mode indicator while the input is focused
+            if not self.text_input_focused:
+                try:
+                    dpg.set_value("status_text", f"Status: {last_status}")
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
