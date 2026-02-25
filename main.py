@@ -39,12 +39,12 @@ state = SimpleNamespace(
 )
 
 # Component handles (set in main())
-pepper:          Optional[PepperRobot]         = None
-gui:             Optional[PepperDearPyGUI]     = None
-brain:           Optional[GroqBrain]           = None
-tts:             Optional[HybridTTSHandler]    = None
-web_searcher:    Optional[WebSearchHandler]    = None
-voice:           Optional[VoiceHandler]        = None
+pepper:          Optional[PepperRobot]          = None
+gui:             Optional[PepperDearPyGUI]      = None
+brain:           Optional[GroqBrain]            = None
+tts:             Optional[HybridTTSHandler]     = None
+web_searcher:    Optional[WebSearchHandler]     = None
+voice:           Optional[VoiceHandler]         = None
 display_manager: Optional[PepperDisplayManager] = None
 
 movement_keys = {k: False for k in ('w', 's', 'a', 'd', 'q', 'e')}
@@ -60,14 +60,7 @@ def _pepper_ok() -> bool:
 def _retry(fn, *args, attempts: int = 2, delay: float = 0.5, **kwargs):
     """
     Call fn(*args, **kwargs) up to `attempts` times.
-
-    On transient failures (network hiccup, Groq 500) the pipeline retries
-    once after `delay` seconds before falling through to the error handler.
-    Two attempts is intentional — if it fails twice the error message to
-    the user is appropriate and we don't want silent retry loops.
-
-    Only used for LLM calls (brain.chat / brain.chat_with_context). TTS
-    has its own 3-tier fallback chain. SSH has its own reconnect logic.
+    Only used for LLM calls — TTS has its own 3-tier fallback.
     """
     last_exc = None
     for attempt in range(attempts):
@@ -82,10 +75,9 @@ def _retry(fn, *args, attempts: int = 2, delay: float = 0.5, **kwargs):
     raise last_exc
 
 
-# ── Volume callback ───────────────────────────────────────────────────────────
+# ── Volume / action callbacks ─────────────────────────────────────────────────
 
 def on_action(action: str):
-    """Called from GUI action buttons (e.g. Pulse Eyes)."""
     if action == "pulse_eyes":
         if _pepper_ok():
             pepper.pulse_eyes("blue", duration=2.0)
@@ -94,7 +86,6 @@ def on_action(action: str):
 
 
 def on_volume_changed(volume: int):
-    """Called from the GUI volume slider. Routes to Pepper hardware if connected."""
     if _pepper_ok():
         pepper.set_volume(volume)
 
@@ -156,16 +147,10 @@ def execute_search(function_calls: list) -> Optional[str]:
 def handle_gui_message(message: str):
     """
     Entry point for all incoming messages (text or voice).
-
-    If the pipeline is free, processing starts immediately on the calling
-    thread. If busy (Pepper is thinking or speaking), the message is queued
-    instead of dropped. The queue is bounded at 3 — if it's full, the oldest
-    message is evicted to make room so the most recent message always lands.
+    If the pipeline is busy, the message is queued rather than dropped.
     """
     if not state.message_lock.acquire(blocking=False):
-        # Pipeline is busy — queue instead of dropping.
         if state.message_queue.full():
-            # Evict the oldest to make room for the newest.
             try:
                 dropped = state.message_queue.get_nowait()
                 logging.warning("Queue full — dropped oldest message: '%s'", dropped[:60])
@@ -177,22 +162,18 @@ def handle_gui_message(message: str):
             if gui:
                 gui.update_status(f"⏳ Queued — {n} waiting")
         except queue.Full:
-            # Shouldn't happen since we just made room, but be safe.
             if gui:
                 gui.add_system_message("⚠️ Queue full — message dropped")
         return
 
-    # Lock acquired — process immediately on this thread.
     _process_message(message)
 
 
 def _process_message(message: str):
     """
     Run one message through the full LLM → gesture → TTS pipeline.
-
     Must always be called with state.message_lock already held.
-    Releases the lock in its finally block, then calls _drain_message_queue
-    so any queued messages are picked up without needing a separate thread.
+    Releases the lock in its finally block.
     """
     _reset_status = True
 
@@ -204,7 +185,6 @@ def _process_message(message: str):
                 gui.add_pepper_message("I'm currently idle. Press SPACE to wake me up!")
             return
 
-        # Goodbye shortcut — checked before starting thinking indicator.
         if config.GOODBYE_WORD.lower() in message.lower():
             _reset_status = False
             _say("Goodbye! It was nice talking with you.")
@@ -223,9 +203,6 @@ def _process_message(message: str):
         if gui:
             gui.update_status("Thinking…")
 
-        # thinking() context manager guarantees eyes stop pulsing even if
-        # an exception fires mid-LLM. nullcontext used in offline mode so
-        # the logic path is identical either way.
         _think_ctx = pepper.thinking() if _pepper_ok() else nullcontext()
 
         with _think_ctx:
@@ -241,10 +218,6 @@ def _process_message(message: str):
             else:
                 response_text, function_calls = _retry(brain.chat, message)
 
-                # Only run the search + follow-up LLM call if the model
-                # returned no text — i.e. it called web_search instead of
-                # answering directly. If it already gave us a response,
-                # trust that and skip the second call entirely.
                 search_results = execute_search(function_calls) if not response_text else None
 
                 if search_results:
@@ -256,16 +229,11 @@ def _process_message(message: str):
                         context=search_results,
                     )
 
-        # Thinking done. Gestures and speech happen outside the context
-        # manager — eyes stop pulsing before Pepper starts speaking.
+        # Gestures fire here — thinking eyes already stopped
         emotion = execute_gestures(function_calls)
 
-        # Set eye colour to match the emotion before speaking so the colour
-        # is visible while Pepper talks. Eyes revert to blue automatically
-        # after speech ends (handled in _hq_speech_animation_loop).
-        if emotion and _pepper_ok():
-            eye_color = pepper.EMOTION_COLOUR_MAP.get(emotion, "blue")
-            pepper.set_eye_color(eye_color)
+        # Emotion color is now set inside speak_hq → play_audio_file via the
+        # LED state machine. No need to call set_eye_color here directly.
 
         if response_text:
             if gui:
@@ -287,51 +255,50 @@ def _process_message(message: str):
         if gui and _reset_status:
             n = state.message_queue.qsize()
             gui.update_status("Ready" if n == 0 else f"Ready — {n} queued")
-        # Always drain — runs on normal exit, early returns, AND exceptions.
-        # Lock is released above before this line, so _drain_message_queue
-        # can re-acquire it safely.
         _drain_message_queue()
 
 
 def _drain_message_queue():
-    """
-    Process the next queued message if one is waiting.
-
-    Uses a check-then-acquire pattern:
-      1. Bail early if the queue is empty (fast path, no lock needed).
-      2. Try to acquire the lock non-blocking.
-      3. Only pop from the queue AFTER holding the lock.
-
-    This guarantees a message is never popped and then lost because the
-    lock acquire failed. If another thread grabbed the lock first (e.g. a
-    new message arrived at exactly this moment), that thread will drain the
-    queue at the end of its own run.
-    """
+    """Process the next queued message if one is waiting."""
     if state.message_queue.empty():
         return
 
     if not state.message_lock.acquire(blocking=False):
-        # Another active processing thread will drain the queue itself.
         return
 
-    # We hold the lock — now safely pop.
     try:
         next_msg = state.message_queue.get_nowait()
     except queue.Empty:
         state.message_lock.release()
         return
 
-    # Process — lock is held, same contract as always.
     _process_message(next_msg)
 
 
 def _say(text: str, emotion: Optional[str] = None):
-    if gui and gui.is_running:
-        gui.update_status("🔊 Speaking…")
+    """
+    Speak text through the best available output path.
+
+    When connected to Pepper:
+        speak_hq() drives the full pipeline and fires status_callback at
+        each stage so the GUI shows granular progress instead of a silent gap:
+            🎙️ Generating voice… → 📡 Sending to robot… → 🔊 Speaking…
+
+    When offline:
+        tts.speak_and_play() handles local playback with basic status feedback.
+
+    LED emotion color is set inside speak_hq → play_audio_file via the LED
+    state machine. Nothing in _say() needs to touch eye colors directly.
+    """
     try:
         if _pepper_ok():
-            pepper.speak_hq(text, tts, emotion=emotion)
+            def _status_cb(msg: str):
+                if gui and gui.is_running:
+                    gui.update_status(msg)
+            pepper.speak_hq(text, tts, emotion=emotion, status_callback=_status_cb)
         else:
+            if gui and gui.is_running:
+                gui.update_status("🎙️ Generating voice…")
             if tts:
                 tts.speak_and_play(text, emotion=emotion)
     finally:
@@ -343,13 +310,11 @@ def _say(text: str, emotion: Optional[str] = None):
 
 def on_press(key):
     try:
-        # Universal cursor gate — text box focused means all keys go to typing
         if gui and gui.text_input_focused:
             return
 
         k = key.char if hasattr(key, "char") and key.char else None
 
-        # ESC — quit
         if key == keyboard.Key.esc:
             print("\n👋 Shutting down…")
             state.running = False
@@ -357,7 +322,6 @@ def on_press(key):
                 gui.is_running = False
             return
 
-        # SPACE — toggle active/idle
         if key == keyboard.Key.space:
             state.robot_active = not state.robot_active
             label = "ACTIVE 🟢" if state.robot_active else "IDLE 🔴"
@@ -372,7 +336,6 @@ def on_press(key):
         if k is None:
             return
 
-        # PTT
         if k == PTT_KEY and config.VOICE_ENABLED:
             acquired = state.ptt_lock.acquire(blocking=False)
             if not acquired:
@@ -391,17 +354,11 @@ def on_press(key):
                     state.ptt_lock.release()
             return
 
-        # Movement keys — update timestamp on PRESS only.
-        # The watchdog in movement_controller is specifically for the case
-        # where a key-up event is dropped (network/focus issue). Updating
-        # on release would defeat the watchdog by resetting it after every
-        # normal key-up.
         if k in movement_keys:
             movement_keys[k]             = True
             state.last_movement_key_time = time.time()
             return
 
-        # Gesture / LED keys — silently ignored when not connected
         if not _pepper_ok():
             return
 
@@ -424,7 +381,6 @@ def on_release(key):
     try:
         k = key.char if hasattr(key, "char") and key.char else None
 
-        # PTT release — always processed regardless of text focus
         if k == PTT_KEY and config.VOICE_ENABLED:
             if state.ptt_active:
                 state.ptt_active = False
@@ -442,9 +398,6 @@ def on_release(key):
             return
 
         if k in movement_keys:
-            # Clear the key state only — do NOT update last_movement_key_time.
-            # The movement_controller loop feeds a heartbeat to the watchdog
-            # while keys are held, so it only fires in genuinely stuck situations.
             movement_keys[k] = False
 
     except AttributeError:
@@ -457,17 +410,11 @@ def movement_controller():
     """
     Sends moveToward() continuously at 20 Hz while any key is held.
 
-    Heartbeat: while movement is active, last_movement_key_time is updated
-    every loop tick. This means the watchdog only fires if the movement loop
-    itself stops feeding updates — i.e. something has genuinely gone wrong —
-    not during normal held-key movement. This eliminates the brief pause/stop
-    that occurred when holding a key longer than the old 2s timeout.
-
-    NAOqi's internal watchdog stops movement if no moveToward() arrives within
-    ~1s, so we keep feeding it every 50ms loop iteration.
+    Completely independent of the speech pipeline — speaking, thinking,
+    and gesturing never touch this loop or the motion API calls here.
     """
-    WATCHDOG_TIMEOUT = 1.0   # seconds — must match documented intent
-    SEND_INTERVAL    = 0.05  # 20 Hz — tighter than the old 10 Hz, less stutter
+    WATCHDOG_TIMEOUT = 1.0
+    SEND_INTERVAL    = 0.05
     prev_any         = False
 
     while state.running:
@@ -478,9 +425,6 @@ def movement_controller():
 
             any_pressed = any(movement_keys.values())
 
-            # Watchdog — catches a genuinely stuck key state (e.g. OS/focus
-            # swallowed the key-up event). Under normal held-key movement this
-            # never fires because we refresh the timestamp below every tick.
             if any_pressed and (time.time() - state.last_movement_key_time > WATCHDOG_TIMEOUT):
                 print("⚠️  Movement watchdog fired — clearing stuck keys")
                 for k in movement_keys:
@@ -491,13 +435,10 @@ def movement_controller():
                 continue
 
             if any_pressed:
-                # Additive axes — allows simultaneous W+A (forward+turn) etc.
                 x     =  0.6 if movement_keys['w'] else -0.6 if movement_keys['s'] else 0.0
                 theta =  0.5 if movement_keys['a'] else -0.5 if movement_keys['d'] else 0.0
                 y     =  0.4 if movement_keys['q'] else -0.4 if movement_keys['e'] else 0.0
                 pepper._move(x, y, theta)
-                # Feed the watchdog — as long as the loop is running and keys
-                # are held this stays fresh, so the watchdog never triggers.
                 state.last_movement_key_time = time.time()
             elif prev_any:
                 pepper.stop_movement()
@@ -556,22 +497,16 @@ def main():
                          ssh_user=config.PEPPER_SSH_USER,
                          ssh_password=config.PEPPER_SSH_PASS)
     pepper.connect()
-    # Queued — processed on first GUI frame (DPG context isn't ready yet here)
-    # gui.set_connection_status() is called below after gui is created.
 
-    # Tablet display manager — always created so the GUI panel is available
-    # even in offline mode. Tablet calls are guarded inside PepperRobot so
-    # they silently no-op if the robot isn't connected or lacks the service.
     display_manager = PepperDisplayManager(pepper_ip=config.PEPPER_IP, port=8765)
     display_manager.set_tablet_fns(
-        show_fn  = pepper.show_tablet_image,
-        clear_fn = pepper.clear_tablet,
+        show_fn    = pepper.show_tablet_image,
+        webview_fn = pepper.show_tablet_webview,
+        clear_fn   = pepper.clear_tablet,
     )
     display_manager.start()
     print("   ✅ Tablet display manager started")
 
-    # HQ audio depends on paramiko to transfer files to Pepper over SSH.
-    # Warn loudly here rather than letting it silently fall back to robotic TTS.
     from pepper_interface import _PARAMIKO_AVAILABLE
     if not _PARAMIKO_AVAILABLE:
         print("\n   ⚠️  ══════════════════════════════════════════════════")
@@ -585,7 +520,7 @@ def main():
         api_key        = config.GROQ_API_KEY,
         llm_model      = config.GROQ_LLM_MODEL,
         whisper_model  = config.GROQ_WHISPER_MODEL,
-        system_prompt  = config.build_system_prompt(),   # fresh date every startup
+        system_prompt  = config.build_system_prompt(),
         functions      = config.ROBOT_FUNCTIONS,
         use_web_search = config.USE_WEB_SEARCH,
         compound_model = config.GROQ_COMPOUND_MODEL,
@@ -678,8 +613,6 @@ def main():
     else:
         gui.update_status("⚠️ Pepper offline — chat only mode")
 
-    # Connection dot — cyan if connected, grey if offline.
-    # Queued here, rendered on first frame.
     gui.set_connection_status(pepper.connected if pepper else False)
 
     try:

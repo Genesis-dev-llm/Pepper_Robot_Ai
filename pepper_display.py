@@ -14,17 +14,20 @@ Architecture:
   │  ALTabletService.showImage(url)  ← one-shot per image   │
   └─────────────────────────────────────────────────────────┘
 
-The HTTP server serves a single in-memory PNG buffer. When a new image
-arrives the buffer is swapped atomically, and the tablet is told to
-reload the URL. No file system writes are needed.
+Static images (PNG, JPG, BMP, WebP) are letter-boxed to 1280×800, encoded to
+PNG in memory, and served at /image.  The tablet fetches them via showImage().
 
-ALTabletService uses HTTP — the tablet's Android browser fetches the
-image from the control PC over the local network. This is the standard
-approach for all Pepper tablet display work.
+Animated GIFs are served as raw file bytes at /gif.  The tablet loads an HTML
+wrapper page at /gifpage (via showWebview) that uses CSS to centre and scale
+the animation.  This avoids per-frame re-encoding and keeps file sizes small.
+
+ALTabletService uses HTTP — the tablet's Android browser fetches the content
+from the control PC over the local network.
 """
 
 import logging
 import os
+import time
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -51,6 +54,30 @@ TABLET_HEIGHT = 800
 # and benefit from the sharpen pass. Images above it are photos and don't.
 _PHOTO_COLOUR_THRESHOLD = 50_000
 
+# HTML template for animated GIF display — CSS handles scaling/centering
+# so we never need to re-encode frames.  The timestamp query param on the
+# <img> src forces the WebView to re-fetch when a new GIF is loaded.
+_GIF_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  html, body {{ width: 100vw; height: 100vh; overflow: hidden;
+               background: #000;
+               display: flex; align-items: center; justify-content: center; }}
+  img {{ max-width: 100vw; max-height: 100vh;
+        display: block;
+        object-fit: contain; }}
+</style>
+</head>
+<body>
+<img src="/gif?t={cache_bust}" alt="">
+</body>
+</html>"""
+
 
 def _get_local_ip(peer_ip: str) -> str:
     """
@@ -75,32 +102,73 @@ def _get_local_ip(peer_ip: str) -> str:
 
 
 class _ImageRequestHandler(BaseHTTPRequestHandler):
-    """Minimal HTTP handler that serves the in-memory image buffer."""
+    """Minimal HTTP handler that serves images and GIF HTML pages."""
 
     # Injected by PepperDisplayManager after class creation
     manager: "PepperDisplayManager" = None
 
     def do_GET(self):
-        if self.path not in ("/image", "/image/"):
+        # Strip query string (cache-buster) before matching
+        clean_path = self.path.split("?")[0].rstrip("/")
+
+        if clean_path == "/image":
+            self._serve_image_buffer()
+        elif clean_path == "/gif":
+            self._serve_gif_buffer()
+        elif clean_path == "/gifpage":
+            self._serve_gif_html()
+        else:
             self.send_response(404)
             self.end_headers()
-            return
 
+    def _serve_image_buffer(self):
+        """Serve the processed PNG image buffer."""
         with self.manager._buffer_lock:
             data = self.manager._image_buffer
 
         if data is None:
-            self.send_response(204)   # No Content
+            self.send_response(204)
             self.end_headers()
             return
 
         self.send_response(200)
         self.send_header("Content-Type", "image/png")
         self.send_header("Content-Length", str(len(data)))
-        # No-cache so the tablet always fetches the latest image
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
+
+    def _serve_gif_buffer(self):
+        """Serve the raw animated GIF bytes."""
+        with self.manager._buffer_lock:
+            data = self.manager._gif_buffer
+
+        if data is None:
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "image/gif")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except BrokenPipeError:
+            pass  # tablet disconnected mid-download (large GIF)
+
+    def _serve_gif_html(self):
+        """Serve the HTML wrapper page that displays the GIF."""
+        cache_bust = int(time.time() * 1000)
+        html = _GIF_HTML_TEMPLATE.format(cache_bust=cache_bust).encode("utf-8")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(html)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(html)
 
     def log_message(self, fmt, *args):
         # Suppress per-request HTTP logs — they're noise in the terminal
@@ -124,23 +192,27 @@ class PepperDisplayManager:
         self.port       = port
         self._local_ip  = _get_local_ip(pepper_ip)
         self.image_url  = f"http://{self._local_ip}:{port}/image"
+        self._base_url  = f"http://{self._local_ip}:{port}"
 
         self._image_buffer: Optional[bytes] = None
+        self._gif_buffer:   Optional[bytes] = None
         self._buffer_lock   = threading.Lock()
         self._http_server: Optional[HTTPServer] = None
         self._server_thread: Optional[threading.Thread] = None
 
         # Injected by main() after PepperRobot is connected
-        self._tablet_show_fn  = None   # callable(url: str) → None
-        self._tablet_clear_fn = None   # callable() → None
+        self._tablet_show_fn    = None   # callable(url: str) → None  (showImage)
+        self._tablet_webview_fn = None   # callable(url: str) → None  (showWebview)
+        self._tablet_clear_fn   = None   # callable() → None
 
         logging.info("PepperDisplayManager: local IP %s, serving on port %d",
                      self._local_ip, port)
 
-    def set_tablet_fns(self, show_fn, clear_fn):
+    def set_tablet_fns(self, show_fn, clear_fn, webview_fn=None):
         """Inject the ALTabletService wrappers from PepperRobot."""
-        self._tablet_show_fn  = show_fn
-        self._tablet_clear_fn = clear_fn
+        self._tablet_show_fn    = show_fn
+        self._tablet_webview_fn = webview_fn
+        self._tablet_clear_fn   = clear_fn
 
     def start(self):
         """Start the HTTP image server in a daemon thread."""
@@ -148,7 +220,6 @@ class PepperDisplayManager:
             logging.warning("PepperDisplayManager.start(): Pillow not available — skipping")
             return
 
-        # Create a handler class with manager injected so it's accessible in do_GET
         handler = type("Handler", (_ImageRequestHandler,), {"manager": self})
 
         self._http_server = HTTPServer(("0.0.0.0", self.port), handler)
@@ -158,7 +229,7 @@ class PepperDisplayManager:
             name="TabletHTTPServer",
         )
         self._server_thread.start()
-        logging.info("Tablet HTTP server started on %s", self.image_url)
+        logging.info("Tablet HTTP server started on %s", self._base_url)
 
     def stop(self):
         """Shut down the HTTP server cleanly."""
@@ -170,19 +241,18 @@ class PepperDisplayManager:
         """
         Process and display an image on Pepper's tablet.
 
-        Processing runs in a worker thread so the GUI stays responsive.
-        Steps:
-          1. Open with Pillow (any format)
-          2. Letterbox to 1280×800 (LANCZOS resize, black bars if needed)
-          3. Optional sharpening for logos/icons (skipped for photos)
-          4. Encode to PNG bytes → swap in-memory buffer
-          5. Tell tablet to (re)load the URL — one HTTP request
+        Static images (PNG, JPG, BMP, WebP):
+          Letterboxed to 1280×800, encoded as PNG, served at /image,
+          displayed via showImage().
+
+        Animated GIFs:
+          Served as raw file bytes at /gif, displayed via showWebview()
+          loading an HTML wrapper at /gifpage.  CSS handles scaling.
 
         Args:
             path:    Absolute path to the image file.
             sharpen: If True AND the image looks like a logo (< 50k unique
                      colours), apply UnsharpMask for extra crispness.
-                     For photos this flag is ignored to avoid artefacts.
         """
         if not _PIL_AVAILABLE:
             logging.warning("show_image: Pillow not available")
@@ -199,6 +269,7 @@ class PepperDisplayManager:
         """Clear the tablet display."""
         with self._buffer_lock:
             self._image_buffer = None
+            self._gif_buffer   = None
         if self._tablet_clear_fn:
             try:
                 self._tablet_clear_fn()
@@ -209,18 +280,74 @@ class PepperDisplayManager:
     # Internal
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_animated_gif(path: str) -> bool:
+        """Return True if the file is an animated GIF with more than one frame."""
+        try:
+            img = Image.open(path)
+            try:
+                img.seek(1)
+                return True
+            except EOFError:
+                return False
+            finally:
+                img.close()
+        except Exception:
+            return False
+
     def _process_and_display(self, path: str, sharpen: bool):
         """Worker: process image, swap buffer, notify tablet."""
+
+        ext = os.path.splitext(path)[1].lower()
+
+        # ── Animated GIF path ──────────────────────────────────────────
+        # Serve the original file bytes directly — no re-encoding.
+        # The tablet's Android WebView handles GIF animation natively.
+        if ext == ".gif" and self._is_animated_gif(path):
+            try:
+                with open(path, "rb") as f:
+                    gif_bytes = f.read()
+            except Exception as e:
+                logging.error("Failed to read GIF '%s': %s", path, e)
+                return
+
+            with self._buffer_lock:
+                self._gif_buffer = gif_bytes
+
+            file_size_kb = len(gif_bytes) / 1024
+            logging.info("Tablet: animated GIF ready (%.0f KB, %s)",
+                         file_size_kb, os.path.basename(path))
+
+            # Use showWebview with the HTML wrapper page
+            cache_bust = int(time.time() * 1000)
+            webview_url = f"{self._base_url}/gifpage?t={cache_bust}"
+
+            if self._tablet_webview_fn:
+                try:
+                    self._tablet_webview_fn(webview_url)
+                    logging.info("Tablet: showWebview(%s)", webview_url)
+                except Exception as e:
+                    logging.warning("Tablet showWebview failed: %s", e)
+            elif self._tablet_show_fn:
+                # Fallback: try showImage with direct GIF URL
+                gif_url = f"{self._base_url}/gif?t={cache_bust}"
+                try:
+                    self._tablet_show_fn(gif_url)
+                    logging.info("Tablet: showImage fallback (%s)", gif_url)
+                except Exception as e:
+                    logging.warning("Tablet showImage(gif) failed: %s", e)
+            else:
+                logging.warning("Tablet: no show_fn set — GIF buffered but not sent")
+            return
+
+        # ── Static image path (PNG, JPG, BMP, WebP, static GIF) ───────
         try:
             img = Image.open(path).convert("RGB")
         except Exception as e:
             logging.error("Failed to open image '%s': %s", path, e)
             return
 
-        # ── Letterbox to TABLET_WIDTH × TABLET_HEIGHT ──────────────────
-        # Fit the image inside 1280×800 preserving aspect ratio.
-        # Black bars are added on the sides/top so Pepper's display is
-        # never stretched or cropped.
+        # Letterbox to TABLET_WIDTH × TABLET_HEIGHT
         img.thumbnail((TABLET_WIDTH, TABLET_HEIGHT), Image.LANCZOS)
         canvas = Image.new("RGB", (TABLET_WIDTH, TABLET_HEIGHT), (0, 0, 0))
         x_off = (TABLET_WIDTH  - img.width)  // 2
@@ -228,40 +355,37 @@ class PepperDisplayManager:
         canvas.paste(img, (x_off, y_off))
         img = canvas
 
-        # ── Optional sharpening (logos/icons only) ──────────────────────
+        # Optional sharpening (logos/icons only)
         if sharpen:
-            # Count unique colours to decide if this is a photo.
-            # Sampling is cheap: convert to paletted 256-colour image and
-            # check — if dithering was needed (many colours → many unique)
-            # we treat it as a photo.
             sample = img.copy().quantize(colors=256, dither=Image.Dither.NONE)
             unique = len(set(sample.getdata()))
-            is_photo = unique >= 200   # quantized to 256, so ≥200 distinct = very colourful
+            is_photo = unique >= 200
 
             if not is_photo:
                 img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=3))
-                logging.info("Tablet: applied sharpening (logo/diagram detected, %d unique colours after quant)", unique)
+                logging.info("Tablet: applied sharpening (%d unique colours after quant)", unique)
             else:
-                logging.info("Tablet: skipped sharpening (photo detected, %d unique colours after quant)", unique)
+                logging.info("Tablet: skipped sharpening (photo, %d unique colours after quant)", unique)
 
-        # ── Encode to PNG bytes ─────────────────────────────────────────
+        # Encode to PNG bytes
         buf = BytesIO()
         img.save(buf, format="PNG", optimize=False)
         png_bytes = buf.getvalue()
 
-        # ── Swap buffer (atomic) ────────────────────────────────────────
+        # Swap buffer
         with self._buffer_lock:
             self._image_buffer = png_bytes
 
         logging.info("Tablet: image ready (%d bytes, %s)",
                      len(png_bytes), os.path.basename(path))
 
-        # ── Tell tablet to fetch the new image ──────────────────────────
+        # Tell tablet to fetch the new image
         if self._tablet_show_fn:
             try:
-                self._tablet_show_fn(self.image_url)
-                logging.info("Tablet: showImage(%s)", self.image_url)
+                cache_bust_url = f"{self.image_url}?t={int(time.time() * 1000)}"
+                self._tablet_show_fn(cache_bust_url)
+                logging.info("Tablet: showImage(%s)", cache_bust_url)
             except Exception as e:
                 logging.warning("Tablet showImage failed: %s", e)
         else:
-            logging.warning("Tablet: no show_fn set — image buffered but not sent to robot")
+            logging.warning("Tablet: no show_fn set — image buffered but not sent")

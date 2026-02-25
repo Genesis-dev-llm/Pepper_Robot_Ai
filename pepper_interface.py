@@ -1,5 +1,15 @@
 """
 Pepper Robot Interface — NAOqi hardware control
+
+Key changes from previous version:
+- LED priority system: thinking > speaking > idle. No more three systems
+  stomping on each other's eye colors from different threads.
+- Speech lock now only covers actual NAOqi playback, not SSH file transfer.
+  Movement is completely unaffected — it never touched this lock anyway.
+- Animation thread is stored and joined after player.play() returns, so
+  there's no race between the loop exiting and the next operation touching LEDs.
+- speak_hq() always cleans up the local temp file via finally, no leaks.
+- speak() now uses a timeout-based lock acquire instead of blocking forever.
 """
 
 import logging
@@ -8,7 +18,7 @@ import random
 import threading
 import time
 from contextlib import contextmanager
-from typing import Optional, TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 
 try:
     import qi
@@ -47,27 +57,38 @@ class PepperRobot:
         self.audio           = None
         self.leds            = None
         self.awareness       = None
-        self.tablet          = None   # ALTabletService — None if unavailable
+        self.tablet          = None
 
+        # Speech lock — held ONLY during active NAOqi audio playback.
+        # Never held during SSH transfer, TTS generation, or movement.
         self._speech_lock  = threading.Lock()
         self._gesture_lock = threading.Lock()
 
-        self._thinking        = False
+        # Thinking pulse state
+        self._thinking         = False
         self._thinking_thread: Optional[threading.Thread] = None
-        self._is_speaking_hq  = False
 
-        # Persistent SSH connection for HQ audio transfer.
-        # Kept alive across utterances — only reconnects when the transport
-        # drops. Saves ~1-2s per response vs opening a new connection each time.
+        # HQ speech animation state
+        self._is_speaking_hq   = False
+        self._anim_thread: Optional[threading.Thread] = None
+
+        # ── LED priority state ─────────────────────────────────────────
+        # Three systems used to write eye colors independently, causing
+        # visible flicker. Now all LED writes go through a single state
+        # machine with explicit priority levels:
+        #   "thinking"  — highest: pulsing while LLM is working
+        #   "speaking"  — holds emotion color while audio plays
+        #   "idle"      — lowest: steady blue or whatever was last set
+        self._led_state         = "idle"   # "idle" | "thinking" | "speaking"
+        self._led_emotion_color = "blue"   # retained during speaking state
+        self._led_lock          = threading.Lock()
+
+        # Persistent SSH connection — kept alive across utterances
         self._ssh_client: Optional["paramiko.SSHClient"] = None
 
-        # --- Gesture cooldown ---
-        # Tracks when any gesture last fired so the background animation loop
-        # doesn't spam conflicting setAngles commands mid-motion.
-        # AI-triggered gestures bypass this (they're intentional) but update
-        # the timestamp, which makes the loop back off after they fire.
+        # Gesture cooldown
         self._last_gesture_time: float = 0.0
-        self._GESTURE_COOLDOWN: float  = 2.5   # seconds
+        self._GESTURE_COOLDOWN: float  = 2.5
 
     # ------------------------------------------------------------------
     # Connection
@@ -116,9 +137,6 @@ class PepperRobot:
             self.leds            = self.session.service("ALLeds")
             self.awareness       = self.session.service("ALBasicAwareness")
 
-            # ALTabletService is available on Pepper 1.8+ but not all firmware
-            # versions expose it. Catch the error gracefully so the rest of
-            # the system works fine even without tablet support.
             try:
                 self.tablet = self.session.service("ALTabletService")
                 print("   ✅ Tablet service available")
@@ -126,7 +144,6 @@ class PepperRobot:
                 self.tablet = None
                 print("   ⚠️  ALTabletService not available — tablet display disabled")
 
-            # Disable Autonomous Life — fights direct motion commands
             try:
                 al = self.session.service("ALAutonomousLife")
                 al.setState("disabled")
@@ -134,14 +151,12 @@ class PepperRobot:
             except Exception as e:
                 print(f"   ⚠️  Autonomous Life: {e}")
 
-            # Stop BasicAwareness — overrides head/body orientation
             try:
                 self.awareness.stopAwareness()
                 print("   ✅ BasicAwareness stopped")
             except Exception as e:
                 print(f"   ⚠️  BasicAwareness: {e}")
 
-            # Shrink collision security distances as much as possible
             try:
                 self.motion.setExternalCollisionProtectionEnabled("Move", False)
                 print("   ✅ Collision protection disabled")
@@ -153,14 +168,12 @@ class PepperRobot:
                 except Exception as e2:
                     print(f"   ⚠️  Collision protection unchanged: {e2}")
 
-            # Ensure body stiffness is on
             try:
                 self.motion.setStiffnesses("Body", 1.0)
                 print("   ✅ Body stiffness set to 1.0")
             except Exception as e:
                 print(f"   ⚠️  Stiffness: {e}")
 
-            # Max speaker volume on connect
             try:
                 self.audio.setOutputVolume(100)
             except Exception:
@@ -208,21 +221,78 @@ class PepperRobot:
                 self._ssh_client = None
 
     # ------------------------------------------------------------------
+    # LED priority state machine
+    # ------------------------------------------------------------------
+    # All eye color changes flow through here. No external code should
+    # call set_eye_color() directly for state-driven purposes — use these
+    # enter/exit methods so the priority logic is always respected.
+    # Manual key presses (LEDs 5/6/7) still call set_eye_color directly
+    # since they're intentional overrides by the operator.
+
+    def _enter_led_thinking(self):
+        """Claim LED ownership for the thinking state (highest priority)."""
+        with self._led_lock:
+            self._led_state = "thinking"
+        # Eye will be set by the pulse loop on its next tick
+
+    def _exit_led_thinking(self):
+        """Release thinking LED ownership → back to idle, steady blue."""
+        with self._led_lock:
+            if self._led_state == "thinking":
+                self._led_state = "idle"
+        self.set_eye_color("blue")
+
+    def _enter_led_speaking(self, emotion_color: str = "blue"):
+        """
+        Claim LED ownership for speaking state and set the emotion color.
+        No-ops if thinking is active (thinking has higher priority).
+        """
+        with self._led_lock:
+            if self._led_state == "thinking":
+                return  # don't stomp on thinking state
+            self._led_state         = "speaking"
+            self._led_emotion_color = emotion_color
+        self.set_eye_color(emotion_color)
+
+    def _exit_led_speaking(self):
+        """
+        Release speaking LED ownership → back to idle, steady blue.
+        Only touches the LED hardware if we actually owned the speaking state.
+        Safe to call multiple times (idempotent).
+        """
+        state_was_speaking = False
+        with self._led_lock:
+            if self._led_state == "speaking":
+                self._led_state         = "idle"
+                self._led_emotion_color = "blue"
+                state_was_speaking = True
+        if state_was_speaking:
+            self.set_eye_color("blue")
+
+    # ------------------------------------------------------------------
     # Speech — built-in NAOqi TTS
     # ------------------------------------------------------------------
 
     def speak(self, text: str, use_animation: bool = True):
-        with self._speech_lock:
-            try:
-                if use_animation and self.animated_speech:
-                    self.animated_speech.say(text)
-                else:
-                    self.tts.say(text)
-            except Exception as e:
-                logging.error("Speech error: %s", e)
+        """
+        NAOqi built-in speech (fallback / offline).
+        Uses a timeout-based lock acquire so it never blocks indefinitely.
+        """
+        acquired = self._speech_lock.acquire(timeout=3.0)
+        if not acquired:
+            logging.warning("speak(): could not acquire speech lock in 3.0s — skipping")
+            return
+        try:
+            if use_animation and self.animated_speech:
+                self.animated_speech.say(text)
+            else:
+                self.tts.say(text)
+        except Exception as e:
+            logging.error("Speech error: %s", e)
+        finally:
+            self._speech_lock.release()
 
     def set_volume(self, volume: int):
-        """Set both TTS voice volume and speaker output volume (0–100)."""
         try:
             self.tts.setVolume(volume / 100.0)
         except Exception as e:
@@ -237,30 +307,47 @@ class PepperRobot:
     # ------------------------------------------------------------------
 
     def speak_hq(self, text: str, tts_handler: "HybridTTSHandler",
-                 emotion: Optional[str] = None) -> bool:
+                 emotion: Optional[str] = None,
+                 status_callback: Optional[Callable[[str], None]] = None) -> bool:
+        """
+        Full HQ pipeline: TTS generation → SSH transfer → NAOqi playback.
+
+        status_callback is called with human-readable progress strings so
+        the GUI can show exactly what's happening during the otherwise-silent
+        gap between LLM response and audio starting.
+
+        Local temp file is always cleaned up in the finally block regardless
+        of which path (success / fallback / exception) is taken.
+        """
+        audio_path = None
         try:
+            if status_callback:
+                status_callback("🎙️ Generating voice…")
             audio_path = tts_handler.speak(text, emotion=emotion)
-            if audio_path and self.play_audio_file(audio_path):
+
+            if audio_path:
+                emotion_color = self.EMOTION_COLOUR_MAP.get(emotion or "", "blue")
+                if self.play_audio_file(audio_path,
+                                        emotion_color    = emotion_color,
+                                        status_callback  = status_callback):
+                    return True
+
+            print("↩️  Falling back to built-in NAOqi TTS")
+            self.speak(text)
+            return False
+
+        finally:
+            # Always delete the local temp file — covers success, fallback, and exception
+            if audio_path:
                 try:
                     os.remove(audio_path)
                 except OSError:
                     pass
-                return True
-        except Exception as e:
-            logging.warning("HQ TTS pipeline error: %s", e)
-
-        print("↩️  Falling back to built-in NAOqi TTS")
-        self.speak(text)
-        return False
 
     def _ensure_ssh(self) -> bool:
         """
         Ensure the persistent SSH connection to Pepper is alive.
-
-        Checks the underlying transport before attempting to reconnect, so
-        healthy connections pay only a cheap attribute lookup per call.
-        Called inside play_audio_file which already holds _speech_lock,
-        so no additional locking is needed here.
+        Called from _transfer_to_robot (no lock held).
         """
         if not _PARAMIKO_AVAILABLE:
             return False
@@ -271,7 +358,6 @@ class PepperRobot:
         except Exception:
             pass
 
-        # Transport is dead or never opened — (re)connect.
         print("🔗 (Re)connecting SSH to Pepper…")
         try:
             if self._ssh_client:
@@ -291,88 +377,149 @@ class PepperRobot:
             self._ssh_client = None
             return False
 
-    def play_audio_file(self, file_path: str, lock_timeout: float = 0.5) -> bool:
+    def _transfer_to_robot(self, local_path: str) -> Optional[str]:
         """
-        Transfer an audio file to Pepper via SFTP and play it through ALAudioPlayer.
+        Transfer an audio file to Pepper via SFTP.
 
-        Uses a persistent SSH connection — the TCP handshake only happens once
-        per session (or after a network drop), not on every utterance.
-        The SFTP channel is opened fresh per transfer; it's cheap once the
-        transport is already established.
+        No speech lock held — SSH + file transfer is completely independent
+        of NAOqi audio. Movement, queued messages, and other operations
+        continue uninterrupted while the file is being sent.
+
+        Returns the remote path on success, None on failure.
+        """
+        if not _PARAMIKO_AVAILABLE:
+            return None
+        remote_path = f"/tmp/{os.path.basename(local_path)}"
+        try:
+            if not self._ensure_ssh():
+                return None
+            sftp = self._ssh_client.open_sftp()
+            sftp.put(local_path, remote_path)
+            sftp.close()
+            return remote_path
+        except Exception as e:
+            logging.warning("SFTP transfer failed: %s", e)
+            return None
+
+    def play_audio_file(self, file_path: str,
+                        emotion_color:   str = "blue",
+                        status_callback: Optional[Callable[[str], None]] = None,
+                        lock_timeout:    float = 2.0) -> bool:
+        """
+        Transfer audio to Pepper and play it through ALAudioPlayer.
+
+        Phase 1 — Transfer (no lock):
+            SSH health check + SFTP put. Movement and queued messages
+            continue freely during this phase.
+
+        Phase 2 — Playback (lock held):
+            Speech lock is acquired only for the NAOqi play() call.
+            Animation thread is started, runs during playback, then
+            joined before the lock is released so LEDs are always in
+            a clean state when the next operation begins.
         """
         if not _PARAMIKO_AVAILABLE:
             print("⚠️  paramiko unavailable — cannot transfer audio to robot")
             return False
 
+        # ── Phase 1: Transfer (lock-free) ─────────────────────────────
+        if status_callback:
+            status_callback("📡 Sending to robot…")
+        remote_path = self._transfer_to_robot(file_path)
+        if not remote_path:
+            return False
+
+        # ── Phase 2: Playback (speech lock only) ──────────────────────
         acquired = self._speech_lock.acquire(timeout=lock_timeout)
         if not acquired:
             print("⚠️  Already speaking — skipping audio playback")
+            self._cleanup_remote(remote_path)
             return False
 
-        remote_path = f"/tmp/{os.path.basename(file_path)}"
         try:
-            if not self._ensure_ssh():
-                return False
+            if status_callback:
+                status_callback("🔊 Speaking…")
 
-            # Open a fresh SFTP channel on the existing transport.
-            sftp = self._ssh_client.open_sftp()
-            sftp.put(file_path, remote_path)
-            sftp.close()
+            # Set emotion color and mark LED state as speaking
+            self._enter_led_speaking(emotion_color)
 
             player  = self.session.service("ALAudioPlayer")
             file_id = player.loadFile(remote_path)
 
+            # Start background animation loop
             self._is_speaking_hq = True
-            threading.Thread(
-                target=self._hq_speech_animation_loop,
-                daemon=True, name="HQSpeechAnim"
-            ).start()
+            anim_thread = threading.Thread(
+                target = self._hq_speech_animation_loop,
+                daemon = True,
+                name   = "HQSpeechAnim",
+            )
+            self._anim_thread = anim_thread
+            anim_thread.start()
 
-            player.play(file_id)
+            player.play(file_id)  # blocks until audio finishes
+            return True
 
         except Exception as e:
             logging.warning("ALAudioPlayer failed: %s", e)
             return False
+
         finally:
-            # Always clear flag and release lock — even on exception.
-            # SSH stays open; only clean up the remote temp file.
+            # Signal animation to stop, then wait for it to exit cleanly.
+            # This guarantees the animation is fully done and LEDs are in
+            # a known state before the lock is released and the next
+            # operation begins.
             self._is_speaking_hq = False
-            if self._ssh_client:
-                try:
-                    self._ssh_client.exec_command(f"rm -f {remote_path}")
-                except Exception:
-                    pass
+            if self._anim_thread and self._anim_thread.is_alive():
+                self._anim_thread.join(timeout=3.0)
+            self._anim_thread = None
+
+            # Reset LED state — safe to call even if anim thread already did it
+            self._exit_led_speaking()
+
+            # Clean up remote temp file
+            self._cleanup_remote(remote_path)
+
             self._speech_lock.release()
 
-        return True
+    def _cleanup_remote(self, remote_path: str):
+        """Remove temp file from Pepper's /tmp. Best-effort."""
+        if self._ssh_client:
+            try:
+                self._ssh_client.exec_command(f"rm -f {remote_path}")
+            except Exception:
+                pass
 
     def _hq_speech_animation_loop(self):
         """
-        Fires random background gestures during HQ audio playback.
+        Background gestures during HQ audio playback.
 
-        Respects _GESTURE_COOLDOWN — if an AI-triggered gesture fired recently
-        (or another background gesture is still running), this loop backs off
-        instead of sending conflicting setAngles commands mid-motion.
-        Movement (base/wheels) is completely independent and never blocked here.
+        Reads emotion color from the LED state instead of hardcoding blue,
+        so the color persists correctly throughout the whole speech.
+        Does NOT call _exit_led_speaking — that's handled in play_audio_file's
+        finally block after this thread is joined.
         """
         gesture_fns = [self.nod, self.explaining_gesture,
                        self.thinking_gesture, self.look_around]
         while self._is_speaking_hq:
             try:
-                self.set_eye_color("blue")
-                # Only attempt a gesture if enough time has passed since the
-                # last one — prevents arm jerk from overlapping commands.
+                # Always reflect the current emotion color, not hardcoded blue
+                with self._led_lock:
+                    color = self._led_emotion_color
+                self.set_eye_color(color)
+
                 if (random.random() > 0.6 and
                         time.time() - self._last_gesture_time >= self._GESTURE_COOLDOWN):
                     random.choice(gesture_fns)()
+
                 for _ in range(20):
                     if not self._is_speaking_hq:
                         break
                     time.sleep(0.1)
+
             except Exception as e:
                 logging.warning("HQ anim loop error: %s", e)
                 break
-        self.set_eye_color("blue")
+        # Loop exits cleanly — play_audio_file's finally handles LED reset
 
     # ------------------------------------------------------------------
     # Thinking indicator + context manager
@@ -384,11 +531,8 @@ class PepperRobot:
         Context manager for the thinking indicator.
 
             with pepper.thinking():
-                response = brain.chat(message)   # eyes pulse while thinking
-            # eyes stop automatically here, even if an exception was raised
-
-        Replaces the old start=True / start=False pair and the fragile
-        _thinking_started flag in main.py.
+                response = brain.chat(message)
+            # eyes reset automatically, even on exception
         """
         self.thinking_indicator(start=True)
         try:
@@ -399,20 +543,30 @@ class PepperRobot:
     def thinking_indicator(self, start: bool = True):
         if start:
             self._thinking = True
+            self._enter_led_thinking()
             if self._thinking_thread is None or not self._thinking_thread.is_alive():
                 self._thinking_thread = threading.Thread(
-                    target=self._pulse_thinking_loop,
-                    daemon=True, name="ThinkingPulse"
+                    target = self._pulse_thinking_loop,
+                    daemon = True,
+                    name   = "ThinkingPulse",
                 )
                 self._thinking_thread.start()
         else:
             self._thinking = False
-            self.set_eye_color("blue")
+            self._exit_led_thinking()
 
     def _pulse_thinking_loop(self):
+        """
+        Alternates eyes blue/off while thinking.
+        Exits immediately if LED state is no longer 'thinking' so it
+        doesn't conflict with speaking state if the two overlap.
+        """
         colours = ["blue", "off"]
         idx = 0
         while self._thinking:
+            with self._led_lock:
+                if self._led_state != "thinking":
+                    break
             try:
                 self.set_eye_color(colours[idx % 2])
                 idx += 1
@@ -430,16 +584,13 @@ class PepperRobot:
     def _run_gesture(self, impl_fn, *args, **kwargs):
         """
         Spawns a daemon thread to run a gesture non-blocking.
-        Records the start time so the animation loop can respect the cooldown.
-        The gesture lock prevents two gestures running simultaneously on the arms.
-        Base movement is on a completely separate motion API and is unaffected.
+        Movement (base/wheels) is on a completely separate motion API
+        and is never touched here.
         """
         def _worker():
             if not self._gesture_lock.acquire(blocking=False):
                 return
             try:
-                # Stamp the time before executing so the animation loop
-                # immediately backs off, not just after the physical move ends.
                 self._last_gesture_time = time.time()
                 impl_fn(*args, **kwargs)
             finally:
@@ -586,10 +737,10 @@ class PepperRobot:
             logging.error("Bow error: %s", e)
 
     # ------------------------------------------------------------------
-    # Movement — moveToward() normalised velocity, -1.0 to 1.0.
-    # Called continuously at 20 Hz by movement_controller while key held.
-    # Completely independent of gesture lock — arms and base move freely
-    # at the same time.
+    # Movement
+    # Movement calls motion.moveToward() directly — completely independent
+    # of the speech lock, gesture lock, and LED state. Speaking, thinking,
+    # and gesturing never block or delay movement.
     # ------------------------------------------------------------------
 
     def move_forward(self,  speed: float = 0.6): self._move( speed,  0,  0)
@@ -625,9 +776,6 @@ class PepperRobot:
         "off":    0x00000000,
     }
 
-    # Maps emotion strings (from express_emotion function calls) to eye colours.
-    # Eyes are set before Pepper starts speaking so the colour is visible while
-    # she talks. The _hq_speech_animation_loop reverts to blue after speaking.
     EMOTION_COLOUR_MAP = {
         "happy":     "yellow",
         "sad":       "blue",
@@ -660,14 +808,6 @@ class PepperRobot:
     # ------------------------------------------------------------------
 
     def show_tablet_image(self, url: str):
-        """
-        Tell Pepper's tablet to display the image at the given URL.
-
-        The URL must be reachable from the tablet's Android browser on the
-        local network — i.e. served by PepperDisplayManager's HTTP server.
-        This is a one-shot call; the image persists on the tablet until
-        clear_tablet() is called or the tablet is woken/reset.
-        """
         if not self.tablet:
             logging.warning("show_tablet_image: ALTabletService not available")
             return
@@ -676,10 +816,23 @@ class PepperRobot:
         except Exception as e:
             logging.warning("show_tablet_image failed: %s", e)
 
+    def show_tablet_webview(self, url: str):
+        """Display an HTML page on the tablet via ALTabletService.showWebview()."""
+        if not self.tablet:
+            logging.warning("show_tablet_webview: ALTabletService not available")
+            return
+        try:
+            self.tablet.showWebview(url)
+        except Exception as e:
+            logging.warning("show_tablet_webview failed: %s", e)
+
     def clear_tablet(self):
-        """Hide any displayed image and return the tablet to its default state."""
         if not self.tablet:
             return
+        try:
+            self.tablet.hideWebview()
+        except Exception:
+            pass
         try:
             self.tablet.hideImage()
         except Exception as e:
