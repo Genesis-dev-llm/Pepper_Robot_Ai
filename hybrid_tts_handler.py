@@ -4,24 +4,26 @@ Hybrid TTS Handler — 3-Tier System
   Tier 2: Edge TTS             — unlimited, always available
   Tier 3: ElevenLabs           — rate-limited, last resort
 
-Emotion is now passed through all three tiers:
-  - Groq:        prepends [emotion] tag to input text (Orpheus voice prompt)
-  - Edge TTS:    maps emotion → rate/pitch adjustments on Communicate()
-  - ElevenLabs:  maps emotion → stability/style in VoiceSettings
-
-Each tier generates its own temp file with the correct suffix for that format.
-Edge TTS uses asyncio.run() instead of manually managing an event loop.
+Fixes from previous version:
+- Edge TTS emotion rate now stacks additively on top of self.edge_rate
+  (parses the % value, adds the emotion offset, reconstructs the string)
+  instead of replacing it entirely.
+- tier_callback: optional callable(str) fired with "Tier 1/2/3" so GUI
+  can display which tier is active.
+- _schedule_midnight_reset(): sets a threading.Timer to auto-reset daily
+  limit flags at midnight. Called once at init.
 """
 
 import asyncio
+import datetime
 import os
 import subprocess
 import tempfile
-from typing import Optional
+import threading
+from typing import Callable, Optional
 
 import edge_tts
 from groq import Groq
-
 
 try:
     from elevenlabs import ElevenLabs as _ElevenLabsClient
@@ -31,24 +33,19 @@ except ImportError:
     _ELEVENLABS_IMPORTABLE = False
 
 
-# ---------------------------------------------------------------------------
-# Emotion mappings
-# ---------------------------------------------------------------------------
+# ── Emotion mappings ───────────────────────────────────────────────────────────
 
-# Edge TTS: rate and pitch adjustments per emotion.
-# Rate is relative (+/-%) from whatever edge_rate the handler was init'd with.
-# Pitch is absolute Hz adjustment on top of the voice default.
-_EDGE_EMOTION_MAP = {
-    "happy":     {"rate": "+15%", "pitch": "+5Hz"},
-    "excited":   {"rate": "+25%", "pitch": "+10Hz"},
-    "sad":       {"rate": "-15%", "pitch": "-5Hz"},
-    "curious":   {"rate": "+5%",  "pitch": "+3Hz"},
-    "surprised": {"rate": "+10%", "pitch": "+8Hz"},
-    "neutral":   {"rate": "+0%",  "pitch": "+0Hz"},
+# Edge TTS: delta % added to whatever self.edge_rate is configured as.
+_EDGE_EMOTION_DELTA = {
+    "happy":     {"rate_delta": +15, "pitch": "+5Hz"},
+    "excited":   {"rate_delta": +25, "pitch": "+10Hz"},
+    "sad":       {"rate_delta": -15, "pitch": "-5Hz"},
+    "curious":   {"rate_delta":  +5, "pitch": "+3Hz"},
+    "surprised": {"rate_delta": +10, "pitch": "+8Hz"},
+    "neutral":   {"rate_delta":   0, "pitch": "+0Hz"},
 }
 
-# ElevenLabs: stability (0=variable/expressive, 1=consistent/flat)
-#             style     (0=neutral, 1=exaggerated — only on v2 models)
+# ElevenLabs
 _EL_EMOTION_MAP = {
     "happy":     {"stability": 0.40, "style": 0.70},
     "excited":   {"stability": 0.30, "style": 0.90},
@@ -57,6 +54,18 @@ _EL_EMOTION_MAP = {
     "surprised": {"stability": 0.30, "style": 0.70},
     "neutral":   {"stability": 0.60, "style": 0.30},
 }
+
+
+def _parse_rate_pct(rate_str: str) -> int:
+    """Parse '+15%' or '-5%' → int (±15 or ±5). Returns 0 on failure."""
+    try:
+        return int(rate_str.replace("%", "").replace("+", ""))
+    except (ValueError, AttributeError):
+        return 0
+
+
+def _make_rate_str(pct: int) -> str:
+    return f"+{pct}%" if pct >= 0 else f"{pct}%"
 
 
 class HybridTTSHandler:
@@ -69,17 +78,19 @@ class HybridTTSHandler:
         elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM",
         edge_voice:          str = "en-US-AriaNeural",
         edge_rate:           str = "+0%",
+        tier_callback:       Optional[Callable[[str], None]] = None,
     ):
-        # ── Tier 1: Groq ──────────────────────────────────────────────
+        # Tier 1: Groq
         self.groq_client = Groq(api_key=groq_api_key)
         self.groq_voice  = groq_voice
         self.groq_model  = groq_model
 
-        # ── Tier 2: Edge TTS ──────────────────────────────────────────
-        self.edge_voice = edge_voice
-        self.edge_rate  = edge_rate   # baseline rate; emotion adjusts from here
+        # Tier 2: Edge TTS
+        self.edge_voice     = edge_voice
+        self.edge_rate      = edge_rate
+        self._edge_rate_pct = _parse_rate_pct(edge_rate)
 
-        # ── Tier 3: ElevenLabs ────────────────────────────────────────
+        # Tier 3: ElevenLabs
         self._el_client          = None
         self.elevenlabs_enabled  = False
         self.elevenlabs_voice_id = elevenlabs_voice_id
@@ -87,7 +98,6 @@ class HybridTTSHandler:
         if elevenlabs_api_key:
             if not _ELEVENLABS_IMPORTABLE:
                 print("⚠️  ElevenLabs key provided but package not installed.")
-                print("    Install: pip install elevenlabs --break-system-packages")
             else:
                 try:
                     self._el_client         = _ElevenLabsClient(api_key=elevenlabs_api_key)
@@ -95,19 +105,22 @@ class HybridTTSHandler:
                 except Exception as e:
                     print(f"⚠️  ElevenLabs init failed: {e}")
 
-        # Daily-limit flags (reset on restart)
         self._groq_daily_limit_hit       = False
         self._elevenlabs_daily_limit_hit = False
 
-        print("🔊 Hybrid TTS ready (3-tier):")
-        print(f"   Tier 1: Groq Orpheus   ({groq_voice})")
-        print(f"   Tier 2: Edge TTS       ({edge_voice}) [unlimited]")
-        el_status = f"({elevenlabs_voice_id})" if self.elevenlabs_enabled else "(disabled)"
-        print(f"   Tier 3: ElevenLabs     {el_status}")
+        # Optional GUI callback: called with "Tier 1", "Tier 2", or "Tier 3"
+        self._tier_callback = tier_callback
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        # Schedule auto-reset of daily limit flags at midnight
+        self._schedule_midnight_reset()
+
+        print("🔊 Hybrid TTS ready (3-tier):")
+        print(f"   Tier 1: Groq Orpheus ({groq_voice})")
+        print(f"   Tier 2: Edge TTS     ({edge_voice}) [unlimited]")
+        el_status = f"({elevenlabs_voice_id})" if self.elevenlabs_enabled else "(disabled)"
+        print(f"   Tier 3: ElevenLabs   {el_status}")
+
+    # ── Public API ─────────────────────────────────────────────────────────────
 
     def speak(
         self,
@@ -115,82 +128,61 @@ class HybridTTSHandler:
         output_file: Optional[str] = None,
         emotion:     Optional[str] = None,
     ) -> Optional[str]:
-        """
-        Generate speech via Groq → Edge TTS → ElevenLabs fallback chain.
-        Emotion is now propagated to all three tiers so the voice character
-        is preserved even when Groq TTS is rate-limited.
-
-        Temp file ownership rules:
-          - output_file is the Groq target (.wav). If Groq fails or produces
-            an empty file, output_file is cleaned up here before falling through.
-          - Each lower tier creates its own temp file. If that tier fails or
-            produces an empty file, it is also cleaned up before falling through.
-          - The returned path is owned by the caller — speak_hq's finally block
-            deletes it unconditionally after playback.
-
-        Returns path to a valid, non-empty audio file, or None on total failure.
-        """
         # Tier 1 — Groq Orpheus
-        # Temp WAV is only created if we're actually going to attempt Groq.
-        # If _groq_daily_limit_hit is True we skip this block entirely, so
-        # no temp file is created and there is nothing to leak.
         if not self._groq_daily_limit_hit:
             if output_file is None:
                 fd, output_file = tempfile.mkstemp(suffix=".wav")
                 os.close(fd)
             if self._speak_groq(text, output_file, emotion):
                 if self._valid_audio(output_file):
+                    self._notify_tier("Tier 1 (Groq)")
                     return output_file
-                print("⚠️  Groq wrote empty/missing file — falling to Tier 2")
-            # Groq attempted but failed or wrote a bad file — clean up before falling through
+                print("⚠️  Groq wrote empty/bad file — falling to Tier 2")
             self._cleanup(output_file)
 
-        # Tier 2 — Edge TTS (unlimited, always available)
+        # Tier 2 — Edge TTS
         fd, edge_file = tempfile.mkstemp(suffix=".mp3")
         os.close(fd)
         if self._speak_edge(text, edge_file, emotion):
             if self._valid_audio(edge_file):
+                self._notify_tier("Tier 2 (Edge)")
                 return edge_file
-            print("⚠️  Edge TTS wrote empty/missing file — falling to Tier 3")
-        # Edge failed or wrote a bad file — clean up before falling through
+            print("⚠️  Edge TTS wrote empty/bad file — falling to Tier 3")
         self._cleanup(edge_file)
 
-        # Tier 3 — ElevenLabs (last resort)
+        # Tier 3 — ElevenLabs
         if self.elevenlabs_enabled and not self._elevenlabs_daily_limit_hit:
             fd, el_file = tempfile.mkstemp(suffix=".mp3")
             os.close(fd)
             if self._speak_elevenlabs(text, el_file, emotion):
                 if self._valid_audio(el_file):
+                    self._notify_tier("Tier 3 (ElevenLabs)")
                     return el_file
-                print("⚠️  ElevenLabs wrote empty/missing file")
+                print("⚠️  ElevenLabs wrote empty/bad file")
             self._cleanup(el_file)
 
         return None
 
     def play_audio(self, audio_file: str):
-        """Play an audio file using the best available system player."""
-        players = ["aplay", "mpg123", "ffplay", "paplay"]
-        for player in players:
+        for player, args in [
+            ("aplay",   [audio_file]),
+            ("mpg123",  [audio_file]),
+            ("ffplay",  ["-nodisp", "-autoexit", "-loglevel", "quiet", audio_file]),
+            ("paplay",  [audio_file]),
+        ]:
             try:
-                if player == "ffplay":
-                    subprocess.run(
-                        [player, "-nodisp", "-autoexit", "-loglevel", "quiet", audio_file],
-                        check=True,
-                    )
-                else:
-                    subprocess.run(
-                        [player, audio_file],
-                        check=True,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
+                subprocess.run(
+                    [player] + args,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
                 return
             except (subprocess.CalledProcessError, FileNotFoundError):
                 continue
         print("⚠️  No audio player found (install aplay, mpg123, or ffplay)")
 
     def speak_and_play(self, text: str, emotion: Optional[str] = None) -> bool:
-        """Generate speech and play it locally (offline mode / testing)."""
         path = self.speak(text, emotion=emotion)
         if not path:
             return False
@@ -201,11 +193,24 @@ class HybridTTSHandler:
     def reset_daily_limits(self):
         self._groq_daily_limit_hit       = False
         self._elevenlabs_daily_limit_hit = False
-        print("🔄 Daily limit flags reset")
+        print("🔄 TTS daily limit flags reset")
+        # Schedule next reset
+        self._schedule_midnight_reset()
 
-    # ------------------------------------------------------------------
-    # Tier implementations
-    # ------------------------------------------------------------------
+    # ── Midnight reset scheduler ───────────────────────────────────────────────
+
+    def _schedule_midnight_reset(self):
+        """Schedule reset_daily_limits() to fire at the next midnight."""
+        now      = datetime.datetime.now()
+        midnight = (now + datetime.timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        seconds_until = (midnight - now).total_seconds()
+        t = threading.Timer(seconds_until, self.reset_daily_limits)
+        t.daemon = True
+        t.start()
+
+    # ── Tier implementations ───────────────────────────────────────────────────
 
     def _speak_groq(self, text: str, output_file: str, emotion: Optional[str]) -> bool:
         if self._groq_daily_limit_hit:
@@ -228,7 +233,7 @@ class HybridTTSHandler:
         except Exception as e:
             err = str(e).lower()
             if "429" in err or "rate limit" in err or "daily" in err:
-                print("⏳ Groq TTS rate-limited → falling to Tier 2 (Edge)")
+                print("⏳ Groq TTS rate-limited → Tier 2")
                 self._groq_daily_limit_hit = True
             else:
                 print(f"⚠️  Groq TTS error: {e}")
@@ -239,7 +244,6 @@ class HybridTTSHandler:
         if not self.elevenlabs_enabled or self._elevenlabs_daily_limit_hit:
             return False
         try:
-            # Build voice settings from emotion mapping if available
             voice_settings = None
             if emotion:
                 settings = _EL_EMOTION_MAP.get(emotion)
@@ -252,7 +256,7 @@ class HybridTTSHandler:
                             style            = settings["style"],
                         )
                     except ImportError:
-                        pass  # older SDK version — skip voice settings
+                        pass
 
             kwargs = dict(
                 voice_id      = self.elevenlabs_voice_id,
@@ -263,9 +267,8 @@ class HybridTTSHandler:
             if voice_settings:
                 kwargs["voice_settings"] = voice_settings
 
-            audio_iter = self._el_client.text_to_speech.convert(**kwargs)
             with open(output_file, "wb") as f:
-                for chunk in audio_iter:
+                for chunk in self._el_client.text_to_speech.convert(**kwargs):
                     if chunk:
                         f.write(chunk)
 
@@ -274,8 +277,8 @@ class HybridTTSHandler:
             return True
         except Exception as e:
             err = str(e).lower()
-            if "quota" in err or "limit" in err or "429" in err or "subscription" in err:
-                print("⚠️  ElevenLabs limit/auth → marking as exhausted")
+            if any(k in err for k in ("quota", "limit", "429", "subscription")):
+                print("⚠️  ElevenLabs limit/auth — marking exhausted")
                 self._elevenlabs_daily_limit_hit = True
             else:
                 print(f"⚠️  ElevenLabs error: {e}")
@@ -284,20 +287,22 @@ class HybridTTSHandler:
     async def _speak_edge_async(self, text: str, output_file: str,
                                 emotion: Optional[str] = None) -> bool:
         try:
-            # Resolve rate and pitch from emotion map; fall back to instance defaults
-            if emotion and emotion in _EDGE_EMOTION_MAP:
-                params = _EDGE_EMOTION_MAP[emotion]
-                rate   = params["rate"]
-                pitch  = params["pitch"]
+            # Stack emotion delta on top of base rate — not replace
+            base_pct = self._edge_rate_pct
+            if emotion and emotion in _EDGE_EMOTION_DELTA:
+                params    = _EDGE_EMOTION_DELTA[emotion]
+                final_pct = base_pct + params["rate_delta"]
+                pitch     = params["pitch"]
             else:
-                rate  = self.edge_rate
-                pitch = "+0Hz"
+                final_pct = base_pct
+                pitch     = "+0Hz"
 
+            rate = _make_rate_str(final_pct)
             comm = edge_tts.Communicate(text, self.edge_voice, rate=rate, pitch=pitch)
             await comm.save(output_file)
 
             emotion_tag = f" [{emotion}]" if emotion else ""
-            print(f"🎤 Tier 2: Edge TTS{emotion_tag}")
+            print(f"🎤 Tier 2: Edge TTS{emotion_tag} (rate={rate}, pitch={pitch})")
             return True
         except Exception as e:
             print(f"❌ Edge TTS error: {e}")
@@ -311,9 +316,7 @@ class HybridTTSHandler:
             print(f"❌ Edge TTS runner error: {e}")
             return False
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    # ── Helpers ────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _valid_audio(path: str) -> bool:
@@ -328,6 +331,13 @@ class HybridTTSHandler:
             os.remove(path)
         except OSError:
             pass
+
+    def _notify_tier(self, label: str):
+        if self._tier_callback:
+            try:
+                self._tier_callback(label)
+            except Exception:
+                pass
 
 
 # Backward-compat alias
