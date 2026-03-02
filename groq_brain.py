@@ -8,6 +8,9 @@ Changes from previous version:
 - History trim now preserves the first user/assistant exchange (intro context)
   and removes from the middle when the window fills.
 - _sanitize_history strips stale tool_call metadata from assistant turns.
+- _clean_response_text now uses a permissive regex for function tag stripping
+  that handles malformed tags where the model omits the closing '>' on the
+  opening tag (e.g. <function=express_emotion{"emotion":"curious"}</function>).
 """
 
 import json
@@ -35,10 +38,28 @@ def _parse_tool_calls(message) -> List[Dict]:
 
 
 def _clean_response_text(text: str) -> str:
-    """Strip function-call artifacts and stage directions from spoken output."""
+    """
+    Strip function-call artifacts and stage directions from spoken output.
+
+    Two failure modes the model can produce:
+
+      Well-formed:  <function=wave>...</function>
+      Malformed:    <function=express_emotion{"emotion":"curious"}</function>
+                    (no '>' closing the opening tag)
+
+    The original regex <function=[^>]*>.*?</function> requires a '>' to close
+    the opening tag and silently skips the malformed variant.  The replacement
+    regex <function=.*?</function> is permissive — it matches from '<function='
+    through the nearest '</function>' regardless of what's between them.
+
+    A second pass catches any unclosed bare <function= fragments that have no
+    matching </function> at all.
+    """
+    # Permissive: catches both well-formed and malformed opening tags
+    text = re.sub(r"<function=.*?</function>", "", text, flags=re.DOTALL)
+    # Catch unclosed / self-closing bare <function= tags (no </function>)
+    text = re.sub(r"<function=[^<\n]*", "", text)
     # XML-style tool tags
-    text = re.sub(r"<function=[^>]*>.*?</function>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<function=[^>/]*/?>", "", text)
     text = re.sub(r"<tool[^>]*>.*?</tool>", "", text, flags=re.DOTALL)
     # Asterisk stage directions
     text = re.sub(r"\*[^*]+\*", "", text)

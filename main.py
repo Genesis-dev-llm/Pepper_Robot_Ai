@@ -3,7 +3,6 @@ Main Control Script — Pepper AI Robot
 """
 
 import logging
-import os
 import queue
 import threading
 import time
@@ -26,22 +25,12 @@ from web_search_handler import WebSearchHandler
 # ── Logging setup ──────────────────────────────────────────────────────────────
 
 def _setup_logging():
-    handlers = [logging.StreamHandler()]
-    if config.LOG_TO_FILE:
-        os.makedirs(config.LOG_DIR, exist_ok=True)
-        log_file = os.path.join(
-            config.LOG_DIR,
-            f"pepper_{time.strftime('%Y-%m-%d')}.log"
-        )
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
     logging.basicConfig(
-        level   = logging.INFO,
-        format  = "%(asctime)s [%(levelname)s] %(message)s",
-        datefmt = "%H:%M:%S",
-        handlers = handlers,
+        level    = logging.INFO,
+        format   = "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt  = "%H:%M:%S",
+        handlers = [logging.StreamHandler()],
     )
-    if config.LOG_TO_FILE:
-        print(f"📝 Logging to {log_file}")
 
 
 # ── Shared state ───────────────────────────────────────────────────────────────
@@ -51,7 +40,6 @@ state = SimpleNamespace(
     running                = True,
     ptt_active             = False,
     last_movement_key_time = 0.0,
-    last_interaction_time  = time.time(),
     message_lock           = threading.Lock(),
     message_queue          = queue.Queue(maxsize=config.MSG_QUEUE_SIZE),
     ptt_lock               = threading.Lock(),
@@ -67,9 +55,6 @@ voice:           Optional[VoiceHandler]         = None
 display_manager: Optional[PepperDisplayManager] = None
 
 # ── Movement keys — snapshot approach for thread safety ───────────────────────
-# Dict is written by pynput thread, read by movement_controller thread.
-# We take a lock only for the brief snapshot (~5µs) at the top of each tick,
-# not for the entire 50ms sleep, so latency impact is negligible.
 _movement_keys      = {k: False for k in ('w', 's', 'a', 'd', 'q', 'e')}
 _movement_keys_lock = threading.Lock()
 
@@ -103,8 +88,6 @@ def _parse_function_calls(function_calls: Optional[List]) -> tuple:
       - gesture_callback: closure that executes all gesture calls (or None)
       - emotion: string from express_emotion (or None)
     Returns (gesture_callback, emotion).
-    The callback is designed to fire right before audio playback starts
-    so gesture and speech are synchronized.
     """
     if not function_calls:
         return None, None
@@ -229,18 +212,15 @@ def _attempt_reconnect():
 def handle_message(message: str):
     """
     Entry point for all messages (text or voice).
-    If pipeline is busy, queues the message. Drops oldest if queue is full
-    and notifies the GUI.
+    If pipeline is busy, queues the message. Drops oldest if queue is full.
     """
-    state.last_interaction_time = time.time()
-
     if not state.message_lock.acquire(blocking=False):
         if state.message_queue.full():
             try:
                 dropped = state.message_queue.get_nowait()
                 logging.warning("Queue full — dropped: '%s'", dropped[:60])
                 if gui:
-                    gui.add_system_message(f"⚠️ Queue full — dropped older message")
+                    gui.add_system_message("⚠️ Queue full — dropped older message")
             except queue.Empty:
                 pass
         try:
@@ -305,8 +285,6 @@ def _process_message(message: str):
                 response_text, function_calls = _retry(brain.chat, message)
 
         # Check if the model requested a web search as a function call
-        # This runs regardless of whether response_text is set — model can
-        # return both text and a search call simultaneously
         search_query = _extract_search_call(function_calls)
         if search_query:
             if gui:
@@ -319,7 +297,6 @@ def _process_message(message: str):
                 context=search_results,
             )
 
-        # Parse gestures + emotion — callback fires at speech onset
         gesture_callback, emotion = _parse_function_calls(function_calls)
 
         if response_text:
@@ -360,8 +337,8 @@ def _drain_queue():
 
 def _say(
     text: str,
-    emotion:          Optional[str]           = None,
-    gesture_callback: Optional[Callable]      = None,
+    emotion:          Optional[str]      = None,
+    gesture_callback: Optional[Callable] = None,
 ):
     try:
         if _pepper_ok():
@@ -379,7 +356,6 @@ def _say(
             if gui and gui.is_running:
                 gui.update_status("🎙️ Generating voice…")
             if tts:
-                # Still fire gesture even in offline mode (no-op if pepper disconnected)
                 if gesture_callback:
                     try:
                         gesture_callback()
@@ -391,33 +367,35 @@ def _say(
             gui.update_status("Ready")
 
 
-# ── Idle timeout watchdog ─────────────────────────────────────────────────────
+# ── Camera stream helpers ─────────────────────────────────────────────────────
 
-def _idle_watchdog():
+def _start_camera_stream():
     """
-    Checks every 10 seconds if ACTIVE_TIMEOUT has been exceeded.
-    When triggered, auto-deactivates Pepper and notifies the GUI.
-    Disabled if ACTIVE_TIMEOUT == 0.
+    Blocking — runs in a daemon thread spawned by main.
+    Uploads camera_stream.py, starts the server on Pepper, waits for it to
+    bind, then points the tablet at the stream page.
+    Calls gui.update_camera_status() with the result when done.
     """
-    if not config.ACTIVE_TIMEOUT:
+    if not _pepper_ok():
+        if gui:
+            gui.add_system_message("⚠️ Pepper not connected — can't start camera stream")
+            gui.update_camera_status(False)
         return
-    while state.running:
-        time.sleep(10)
-        if not state.robot_active:
-            continue
-        elapsed = time.time() - state.last_interaction_time
-        if elapsed >= config.ACTIVE_TIMEOUT:
-            print(f"⏰ Idle timeout ({config.ACTIVE_TIMEOUT}s) — auto-deactivating")
-            state.robot_active = False
-            if _pepper_ok():
-                try:
-                    pepper.set_eye_color("white")
-                except Exception:
-                    pass
-            if gui:
-                gui.set_robot_active(False)
-                gui.update_status("Idle (auto — timeout)")
-                gui.add_system_message(f"⏰ Auto-idled after {config.ACTIVE_TIMEOUT}s of inactivity")
+    success = pepper.start_tablet_camera_stream()
+    if gui:
+        gui.update_camera_status(success)
+        if not success:
+            gui.add_system_message(
+                "❌ Camera stream failed — check /tmp/camera_stream.log on Pepper"
+            )
+
+
+def _stop_camera_stream():
+    """Instant — kills server process and clears tablet."""
+    if _pepper_ok():
+        pepper.stop_tablet_camera_stream()
+    if gui:
+        gui.update_camera_status(False)
 
 
 # ── Keyboard handlers ──────────────────────────────────────────────────────────
@@ -438,12 +416,10 @@ def on_press(key):
 
         if key == keyboard.Key.space:
             state.robot_active = not state.robot_active
-            state.last_interaction_time = time.time()
             label = "ACTIVE 🟢" if state.robot_active else "IDLE 🔴"
             print(f"\n{'='*50}\nPepper is now {label}\n{'='*50}\n")
             if _pepper_ok():
                 pepper.set_eye_color("blue" if state.robot_active else "white")
-            # Route through GUI queue — safe from pynput thread
             if gui:
                 gui.set_robot_active(state.robot_active)
                 gui.update_status("Active — ready" if state.robot_active else "Idle")
@@ -527,8 +503,7 @@ def on_release(key):
 def movement_controller():
     """
     20Hz movement loop. Takes a brief lock snapshot at the top of each tick
-    (~5µs) to safely read movement key state across threads. The 50ms sleep
-    is not inside the lock.
+    (~5µs) to safely read movement key state across threads.
     """
     WATCHDOG_TIMEOUT = 1.0
     SEND_INTERVAL    = 0.05
@@ -540,7 +515,6 @@ def movement_controller():
                 time.sleep(SEND_INTERVAL)
                 continue
 
-            # Snapshot — lock held for ~5µs only
             with _movement_keys_lock:
                 keys = dict(_movement_keys)
 
@@ -588,8 +562,6 @@ def print_controls():
     print("\n✋ GESTURES:  1=Wave  2=Nod  3=Shake  4=Think  8=Explain  9=Excited  0=Point")
     print("💡 LEDs:     5=Blue  6=Green  7=Red")
     print("\n⚙️ SYSTEM:  SPACE=Wake/Sleep  ESC=Quit")
-    if config.ACTIVE_TIMEOUT:
-        print(f"⏰ Auto-idle after {config.ACTIVE_TIMEOUT}s of inactivity")
     print("="*60 + "\n")
 
 
@@ -632,11 +604,11 @@ def main():
 
     print("\n3️⃣  Initialising AI brain…")
     brain = GroqBrain(
-        api_key       = config.GROQ_API_KEY,
-        llm_model     = config.GROQ_LLM_MODEL,
-        whisper_model = config.GROQ_WHISPER_MODEL,
-        system_prompt = config.build_system_prompt(),
-        functions     = config.ROBOT_FUNCTIONS,
+        api_key        = config.GROQ_API_KEY,
+        llm_model      = config.GROQ_LLM_MODEL,
+        whisper_model  = config.GROQ_WHISPER_MODEL,
+        system_prompt  = config.build_system_prompt(),
+        functions      = config.ROBOT_FUNCTIONS,
         use_web_search = config.USE_WEB_SEARCH,
     )
 
@@ -685,14 +657,8 @@ def main():
                 gui.update_status("🔄 Transcribing…")
 
         def _on_transcribed(text: str):
-            """
-            Unified voice dispatch: display the transcribed text in the GUI
-            then dispatch it through the same message path as typed text.
-            Thread is spawned here (main.py), not inside the GUI render loop.
-            """
             print(f"📝 Transcribed: \"{text}\"")
             if gui:
-                # Show in chat without spawning another thread
                 gui.add_chat_message(text, source="voice")
             threading.Thread(
                 target=handle_message,
@@ -729,7 +695,6 @@ def main():
     kb_listener.start()
 
     threading.Thread(target=movement_controller, daemon=True, name="MovementController").start()
-    threading.Thread(target=_idle_watchdog,      daemon=True, name="IdleWatchdog").start()
 
     print_controls()
 
@@ -742,6 +707,11 @@ def main():
         action_callback        = on_action,
         display_callback       = display_manager.show_image if display_manager else None,
         clear_display_callback = display_manager.clear_display if display_manager else None,
+        webview_callback       = lambda url: pepper.show_tablet_webview(url) if _pepper_ok() else None,
+        start_camera_callback  = lambda: threading.Thread(
+            target=_start_camera_stream, daemon=True, name="CameraStart"
+        ).start(),
+        stop_camera_callback   = _stop_camera_stream,
     )
 
     if _pepper_ok():
@@ -764,6 +734,9 @@ def main():
         if display_manager:
             display_manager.stop()
         if pepper:
+            # Stop camera stream BEFORE disconnect — disconnect() closes the
+            # SSH client, so the pkill command must go out while it's still open.
+            pepper.stop_tablet_camera_stream()
             if pepper.connected:
                 pepper.set_volume(40)
             pepper.disconnect()

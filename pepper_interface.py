@@ -5,13 +5,21 @@ Changes from previous version:
 - gesture_callback parameter added to speak_hq() and play_audio_file().
   The callback fires immediately before player.play() so intentional gestures
   are synchronized with speech onset rather than finishing before speech starts.
-- SSH keepalive (set_keepalive) + real liveness probe (exec_command echo)
-  instead of just checking transport.is_active().
+- SSH keepalive (set_keepalive) to keep idle sessions alive between clips.
 - _valid_audio now checks WAV/MP3 magic bytes, not just file size.
 - EMOTION_COLOUR_MAP updated — each emotion now has a visually distinct color.
 - Dead named movement methods removed (only _move() is used).
 - _hq_speech_animation_loop gesture pool expanded.
 - speak() lock timeout surfaced as a parameter for clarity.
+
+Latest changes:
+- show_tablet_webview: fixed call order to loadUrl() → showWebview() per NAOqi
+  spec. Previously called showWebview(url) directly which is wrong on most
+  firmware versions.
+- _ensure_ssh: removed exec_command("echo ok") liveness probe from the hot
+  path. The 30s keepalive already handles silent drops; the probe was blocking
+  for up to 2s on every audio playback call. SFTP failures now surface
+  reactively through the existing single-retry path.
 """
 
 import logging
@@ -42,6 +50,10 @@ if TYPE_CHECKING:
     from hybrid_tts_handler import HybridTTSHandler
 
 import config
+
+# Absolute path of the directory containing this file.
+# Used to locate camera_stream.py for deployment to Pepper.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class PepperRobot:
@@ -291,20 +303,20 @@ class PepperRobot:
 
     def _ensure_ssh(self) -> bool:
         """
-        Ensure SSH is alive. Uses a real no-op command to verify liveness
-        rather than just checking transport state (which can be stale after
-        a WiFi blip).
+        Ensure SSH is alive. Uses transport.is_active() as a fast flag check.
+        The 30s keepalive (set_keepalive) already handles silent drops, so
+        we no longer run exec_command("echo ok") on every call — that was
+        blocking for up to 2s on the hot path before any audio transferred.
+        SFTP failures are surfaced reactively through the existing retry in
+        _transfer_to_robot.
         """
         if not _PARAMIKO_AVAILABLE:
             return False
 
-        # First try a lightweight probe on the existing connection
         if self._ssh_client:
             try:
                 transport = self._ssh_client.get_transport()
                 if transport and transport.is_active():
-                    # Real liveness check — not just checking the flag
-                    self._ssh_client.exec_command("echo ok", timeout=2)
                     return True
             except Exception:
                 pass
@@ -324,7 +336,7 @@ class PepperRobot:
                 password = self.ssh_password,
                 timeout  = 5,
             )
-            # Set keepalive so idle sessions don't silently die
+            # Keepalive keeps idle sessions alive between audio clips
             transport = client.get_transport()
             if transport:
                 transport.set_keepalive(config.SSH_KEEPALIVE_INTERVAL)
@@ -683,7 +695,7 @@ class PepperRobot:
         "off":    0x00000000,
     }
 
-    # Each emotion now has a visually distinct color
+    # Each emotion has a visually distinct color
     EMOTION_COLOUR_MAP = {
         "happy":     "yellow",   # warm, positive
         "sad":       "blue",     # classic sad blue
@@ -747,10 +759,19 @@ class PepperRobot:
             logging.warning("show_tablet_image: %s", e)
 
     def show_tablet_webview(self, url: str):
+        """
+        Display a URL in Pepper's tablet browser.
+
+        Correct NAOqi call order: loadUrl() loads the page into the browser
+        engine, then showWebview() (no argument) brings the webview panel into
+        view.  Calling showWebview(url) directly is incorrect per the SDK spec
+        and may silently fail on some firmware versions.
+        """
         if not self.tablet:
             return
         try:
-            self.tablet.showWebview(url)
+            self.tablet.loadUrl(url)
+            self.tablet.showWebview()
         except Exception as e:
             logging.warning("show_tablet_webview: %s", e)
 
@@ -763,3 +784,83 @@ class PepperRobot:
                 method()
             except Exception:
                 pass
+
+    # ── Camera → Tablet streaming ─────────────────────────────────────────────
+
+    def start_tablet_camera_stream(self) -> bool:
+        """
+        Deploy camera_stream.py to Pepper via SFTP and start it as a
+        background process, then point the tablet browser at the MJPEG page.
+
+        The script runs on Pepper's head CPU, subscribes to ALVideoDevice
+        locally (127.0.0.1), and serves MJPEG at port 8080.  The tablet
+        reaches it over the internal USB link at 198.18.0.1:8080 — no WiFi.
+
+        Returns True if the stream started and the tablet was pointed at it.
+        Returns False with a printed reason on any failure.
+        """
+        if not _PARAMIKO_AVAILABLE:
+            print("❌ Camera stream: paramiko not installed")
+            return False
+        if not self.tablet:
+            print("❌ Camera stream: tablet service not available")
+            return False
+
+        local_script = os.path.join(_SCRIPT_DIR, "camera_stream.py")
+        if not os.path.isfile(local_script):
+            print("❌ Camera stream: camera_stream.py not found at {0}".format(local_script))
+            return False
+
+        if not self._ensure_ssh():
+            print("❌ Camera stream: SSH connection failed")
+            return False
+
+        remote_script = "/home/nao/camera_stream.py"
+        try:
+            sftp = self._ssh_client.open_sftp()
+            sftp.put(local_script, remote_script)
+            sftp.close()
+            print("📤 camera_stream.py uploaded to Pepper")
+        except Exception as e:
+            print("❌ Camera stream: SFTP upload failed: {0}".format(e))
+            return False
+
+        # Kill any stale instance then launch fresh in the background
+        launch_cmd = (
+            "pkill -f camera_stream.py 2>/dev/null; sleep 0.3; "
+            "python {script} > /tmp/camera_stream.log 2>&1 &"
+        ).format(script=remote_script)
+        try:
+            self._ssh_client.exec_command(launch_cmd)
+        except Exception as e:
+            print("❌ Camera stream: launch command failed: {0}".format(e))
+            return False
+
+        # Give the server time to bind port 8080 before pointing the tablet at it
+        print("⏳ Waiting for camera server to start…")
+        time.sleep(2.0)
+
+        stream_url = "http://198.18.0.1:8080/stream.html"
+        try:
+            self.tablet.loadUrl(stream_url)
+            self.tablet.showWebview()
+            print("📷 Camera stream live → {0}".format(stream_url))
+            return True
+        except Exception as e:
+            logging.warning("Camera stream: tablet webview failed: %s", e)
+            return False
+
+    def stop_tablet_camera_stream(self):
+        """
+        Kill the MJPEG server process on Pepper and clear the tablet display.
+        Safe to call even if the stream was never started.
+        """
+        if self._ssh_client:
+            try:
+                self._ssh_client.exec_command("pkill -f camera_stream.py || true")
+                print("📷 Camera stream stopped")
+            except Exception as e:
+                logging.warning("stop_tablet_camera_stream kill failed: %s", e)
+
+        # Always clear the tablet regardless of SSH state
+        self.clear_tablet()

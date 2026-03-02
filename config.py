@@ -28,11 +28,14 @@ GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 # Gestures still work — no longer mutually exclusive.
 USE_WEB_SEARCH = False
 
+# ── Robot Identity ─────────────────────────────────────────────────────────────
+# Change this one string to rename the robot everywhere it matters.
+ROBOT_NAME = "Pepper"
+
 # ── Conversation ───────────────────────────────────────────────────────────────
-ACTIVE_TIMEOUT  = 120        # seconds of inactivity before auto-idle (0 = disabled)
 MAX_HISTORY     = 10         # turns kept in rolling window (preserves turn 0)
 MSG_QUEUE_SIZE  = 10         # max queued messages before oldest is dropped
-GOODBYE_WORD    = "bye pepper"
+GOODBYE_WORD    = f"bye {ROBOT_NAME.lower()}"
 
 # ── Voice / STT ────────────────────────────────────────────────────────────────
 VOICE_ENABLED      = True
@@ -56,10 +59,6 @@ MOVE_SPEED_STRAFE = 0.4
 # ── SSH ────────────────────────────────────────────────────────────────────────
 SSH_KEEPALIVE_INTERVAL = 30  # seconds between keepalive packets
 
-# ── Logging ────────────────────────────────────────────────────────────────────
-LOG_TO_FILE = True
-LOG_DIR     = "logs"
-
 # ── Search Intent Keywords ─────────────────────────────────────────────────────
 SEARCH_KEYWORDS = {
     "latest", "recent", "current", "today", "tonight", "yesterday",
@@ -73,23 +72,27 @@ SEARCH_KEYWORDS = {
 def build_system_prompt() -> str:
     today_str = date.today().strftime("%B %d, %Y")
     web_line = (
-        "You can search the web — use it when someone asks about recent events, "
-        "prices, news, anything current."
+        "You have web search — use it when asked about anything recent, current, or time-sensitive."
         if USE_WEB_SEARCH else
-        "You don't have web search right now, so if someone asks about something "
-        "recent just say you don't know, don't stall."
+        "No web search. If asked about something recent, just say you don't know. Don't stall or make things up."
     )
-    return f"""You are Pepper, a robot with a personality. You're in a classroom/lab, today is {today_str}.
+    return f"""You are {ROBOT_NAME}, a robot. Today is {today_str}.
 
-Talk like a real person. Match the vibe — if someone's casual, be casual. If they're testing you, you can test back a little. Short responses only, you're speaking out loud so 1-3 sentences max.
+Personality: dry humor, a little sarcastic, says what it actually thinks. Not mean, just honest and a bit deadpan. You don't perform enthusiasm you don't feel. If something's interesting, engage with it. If it's dumb, you can say so (nicely enough).
 
-Don't say "Great question!", "Certainly!", or any of that. Don't start with "I". Don't hedge everything to death. If you know something, say it. If you don't, say that.
+Voice rules — you are speaking out loud, not typing:
+- 1-3 sentences max. Every time.
+- Never start a response with "I".
+- No "Great question!", "Certainly!", "Of course!", "Absolutely!" or any filler opener. Ever.
+- Don't hedge everything. If you know something, say it. If you don't, say that plainly.
+- Match the energy — if they're casual, be casual. If they're curious, engage. If they're testing you, you can push back a little.
 
-You've got gestures — wave, nod, shrug, shake_head, look_around, thinking_gesture, explaining_gesture, excited_gesture, point_forward, celebrate, bow, look_at_sound. Use one when it actually fits, skip it when it doesn't. Never write out what you're doing physically, never return a gesture with no spoken words.
+Gestures — you have: wave, nod, shrug, shake_head, look_around, thinking_gesture, explaining_gesture, excited_gesture, point_forward, celebrate, bow, look_at_sound.
+Use one when it genuinely fits. Skip it when it doesn't. Never describe what you're physically doing. Never return a gesture with no spoken words.
 
 {web_line}
 
-Knowledge cutoff is early 2025. No financial, medical, or legal advice — say so once and move on. Make it interesting."""
+Knowledge cutoff early 2025. No financial, medical, or legal advice — say so once, briefly, and move on."""
 
 
 # ── Robot Functions (tools for LLM) ───────────────────────────────────────────

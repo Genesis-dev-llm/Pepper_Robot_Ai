@@ -9,6 +9,16 @@ Changes from previous version:
 - TTS tier label displayed in status area.
 - Audio level meter shown during recording, hidden otherwise.
 - MAX_CHAT_MESSAGES raised to 100.
+
+Latest changes:
+- Tablet Display panel now has two additional sections:
+    1. Web Browser: URL input + Browse + Hide Browser buttons.
+       Wired to webview_callback(url) / clear_display_callback().
+    2. Camera Stream: Start/Stop toggle button + status indicator.
+       Wired to start_camera_callback() / stop_camera_callback().
+       start_camera_callback is expected to be non-blocking (caller
+       spawns its own thread). update_camera_status(bool) is thread-safe
+       and updates the button label and status dot from any thread.
 """
 
 import os
@@ -60,13 +70,25 @@ def _pick_file_native(title: str = "Select Image") -> str | None:
 
 
 class PepperDearPyGUI:
-    def __init__(self, message_callback, volume_callback=None, action_callback=None,
-                 display_callback=None, clear_display_callback=None):
+    def __init__(
+        self,
+        message_callback,
+        volume_callback        = None,
+        action_callback        = None,
+        display_callback       = None,
+        clear_display_callback = None,
+        webview_callback       = None,
+        start_camera_callback  = None,
+        stop_camera_callback   = None,
+    ):
         self.message_callback       = message_callback
         self.volume_callback        = volume_callback
         self.action_callback        = action_callback
         self.display_callback       = display_callback
         self.clear_display_callback = clear_display_callback
+        self.webview_callback       = webview_callback
+        self.start_camera_callback  = start_camera_callback
+        self.stop_camera_callback   = stop_camera_callback
         self.is_running             = False
 
         self.message_queue = queue.Queue()
@@ -85,6 +107,8 @@ class PepperDearPyGUI:
         self._is_wayland     = _detect_wayland()
         self._drop_supported = False
         self._picker_open    = False
+
+        self._camera_streaming = False
 
     # ── text_input_focused ─────────────────────────────────────────────────────
 
@@ -163,7 +187,7 @@ class PepperDearPyGUI:
                 dpg.add_text("🔴  RECORDING — Release R to send",
                              tag="recording_label", color=(255, 80, 80))
                 dpg.add_progress_bar(
-                    tag=    "audio_level_bar",
+                    tag="audio_level_bar",
                     default_value=0.0,
                     width=-1,
                     overlay="",
@@ -224,8 +248,10 @@ class PepperDearPyGUI:
 
             dpg.add_separator()
 
-            # Tablet display (collapsible)
+            # ── Tablet Display (collapsible) ──────────────────────────────────
             with dpg.collapsing_header(label="🖼️ Tablet Display", default_open=False):
+
+                # ── Image section ─────────────────────────────────────────────
                 dpg.add_text("Send an image to Pepper's chest tablet.", color=(180, 180, 180))
                 dpg.add_spacer(height=6)
 
@@ -255,6 +281,51 @@ class PepperDearPyGUI:
                 dpg.add_spacer(height=2)
                 dpg.add_text("No image loaded", tag="display_status_text", color=(150, 150, 150))
 
+                dpg.add_separator()
+
+                # ── Web browser section ───────────────────────────────────────
+                dpg.add_text("🌐 Tablet Browser", color=(180, 180, 180))
+                dpg.add_spacer(height=4)
+                with dpg.group(horizontal=True):
+                    dpg.add_input_text(
+                        tag="webview_url_input",
+                        hint="https://…",
+                        width=-220,
+                    )
+                    dpg.add_spacer(width=6)
+                    dpg.add_button(label="Browse", width=100,
+                                   callback=self._on_browse)
+                    dpg.add_spacer(width=6)
+                    dpg.add_button(label="Hide Browser", width=100,
+                                   callback=self._on_hide_browser)
+                dpg.add_spacer(height=2)
+                dpg.add_text(
+                    "Enter a URL and tap Browse to open it on Pepper's tablet.",
+                    color=(120, 120, 120),
+                )
+
+                dpg.add_separator()
+
+                # ── Camera stream section ─────────────────────────────────────
+                dpg.add_text("📷 Live Camera Feed", color=(180, 180, 180))
+                dpg.add_spacer(height=4)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(
+                        label="📷 Start Stream",
+                        tag="camera_toggle_btn",
+                        width=140,
+                        callback=self._on_camera_toggle,
+                    )
+                    dpg.add_spacer(width=10)
+                    dpg.add_text("●", tag="camera_status_dot", color=(120, 120, 120))
+                    dpg.add_spacer(width=4)
+                    dpg.add_text("Offline", tag="camera_status_label", color=(150, 150, 150))
+                dpg.add_spacer(height=2)
+                dpg.add_text(
+                    "Streams Pepper's front camera to the tablet over the internal USB link.",
+                    color=(120, 120, 120),
+                )
+
         dpg.set_primary_window("main_window", True)
         self._add_system_message("🤖 Pepper AI Control Dashboard started")
         self._add_system_message("Click the input box to type, or hold R to speak")
@@ -269,10 +340,6 @@ class PepperDearPyGUI:
         self.message_queue.put(("system", message))
 
     def add_chat_message(self, text: str, source: str = "text"):
-        """
-        Display a user message. source='voice' for transcribed speech,
-        source='text' for typed input. No thread spawning — that's main.py's job.
-        """
         self.message_queue.put(("user_display", (text, source)))
 
     def update_status(self, status: str):
@@ -282,19 +349,20 @@ class PepperDearPyGUI:
         self.message_queue.put(("recording_state", recording))
 
     def set_robot_active(self, active: bool):
-        """Thread-safe — routes through queue instead of direct DPG call."""
         self.message_queue.put(("robot_active", active))
 
     def set_connection_status(self, connected: bool):
         self.message_queue.put(("connection_status", connected))
 
     def update_tts_tier(self, label: str):
-        """Show which TTS tier fired (e.g. 'Tier 2 (Edge)')."""
         self.message_queue.put(("tts_tier", label))
 
     def update_audio_level(self, level: float):
-        """Update the audio level bar (0.0–1.0). Called ~10x/sec during recording."""
         self.message_queue.put(("audio_level", level))
+
+    def update_camera_status(self, streaming: bool):
+        """Thread-safe — call from any thread to update button + status dot."""
+        self.message_queue.put(("camera_status", streaming))
 
     # ── Input focus handlers ───────────────────────────────────────────────────
 
@@ -430,6 +498,54 @@ class PepperDearPyGUI:
         except Exception:
             pass
 
+    # ── Web browser callbacks ──────────────────────────────────────────────────
+
+    def _on_browse(self):
+        try:
+            url = dpg.get_value("webview_url_input").strip()
+        except Exception:
+            return
+        if not url:
+            return
+        # Prepend https:// if the user left off the scheme
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = "https://" + url
+            try:
+                dpg.set_value("webview_url_input", url)
+            except Exception:
+                pass
+        if self.webview_callback:
+            self.webview_callback(url)
+
+    def _on_hide_browser(self):
+        """Hide the webview — delegates to the existing clear_display path."""
+        if self.clear_display_callback:
+            self.clear_display_callback()
+
+    # ── Camera stream callbacks ────────────────────────────────────────────────
+
+    def _on_camera_toggle(self):
+        if self._camera_streaming:
+            # Stop path is instant — kill + clear tablet, no sleep.
+            # Always reset the UI immediately; _stop_camera_stream in main.py
+            # also calls update_camera_status(False) — double update is harmless.
+            if self.stop_camera_callback:
+                self.stop_camera_callback()
+            self.update_camera_status(False)
+        else:
+            # Disable button while starting to prevent double-clicks.
+            # start_camera_callback is non-blocking — main.py wraps it in a thread.
+            try:
+                dpg.configure_item("camera_toggle_btn",
+                                   label="⏳ Starting…",
+                                   enabled=False)
+            except Exception:
+                pass
+            if self.start_camera_callback:
+                self.start_camera_callback()
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
     def _update_drop_zone_hint(self, text: str, color=(120, 120, 120)):
         try:
             dpg.configure_item("display_drag_hint", default_value=text, color=color)
@@ -486,6 +602,28 @@ class PepperDearPyGUI:
             except Exception:
                 pass
 
+    def _set_camera_status_internal(self, streaming: bool):
+        self._camera_streaming = streaming
+        try:
+            if streaming:
+                dpg.configure_item("camera_toggle_btn",
+                                   label="⏹ Stop Stream",
+                                   enabled=True)
+                dpg.configure_item("camera_status_dot",  color=(80, 200, 80))
+                dpg.configure_item("camera_status_label",
+                                   default_value="Streaming",
+                                   color=(80, 200, 80))
+            else:
+                dpg.configure_item("camera_toggle_btn",
+                                   label="📷 Start Stream",
+                                   enabled=True)
+                dpg.configure_item("camera_status_dot",  color=(120, 120, 120))
+                dpg.configure_item("camera_status_label",
+                                   default_value="Offline",
+                                   color=(150, 150, 150))
+        except Exception:
+            pass
+
     # ── Frame-loop queue drain ─────────────────────────────────────────────────
 
     def _process_queues(self):
@@ -506,7 +644,6 @@ class PepperDearPyGUI:
                 elif kind == "recording_state":
                     self._set_recording_internal(data)
                 elif kind == "robot_active":
-                    # Thread-safe DPG configure call — from render thread
                     try:
                         color = (80, 200, 80) if data else (200, 60, 60)
                         dpg.configure_item("active_dot", color=color)
@@ -528,6 +665,8 @@ class PepperDearPyGUI:
                         dpg.set_value("audio_level_bar", float(data))
                     except Exception:
                         pass
+                elif kind == "camera_status":
+                    self._set_camera_status_internal(data)
                 elif kind == "file_selected":
                     self._on_image_selected(None, {"file_path_name": data})
             except queue.Empty:
