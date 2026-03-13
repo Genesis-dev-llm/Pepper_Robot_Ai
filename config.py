@@ -26,11 +26,11 @@ GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 # ── Web Search ─────────────────────────────────────────────────────────────────
 # When True, web_search is included in ROBOT_FUNCTIONS and the model can call it.
 # Gestures still work — no longer mutually exclusive.
-USE_WEB_SEARCH = False
+USE_WEB_SEARCH = True
 
 # ── Robot Identity ─────────────────────────────────────────────────────────────
 # Change this one string to rename the robot everywhere it matters.
-ROBOT_NAME = "Pepper"
+ROBOT_NAME = "Siri"
 
 # ── Conversation ───────────────────────────────────────────────────────────────
 MAX_HISTORY     = 10         # turns kept in rolling window (preserves turn 0)
@@ -45,6 +45,21 @@ AUDIO_CHANNELS     = 1
 AUDIO_MIN_DURATION = 0.5
 AUDIO_MAX_DURATION = 30.0
 VAD_THRESHOLD      = 0.01    # RMS energy floor — recordings below this are discarded
+
+# ── Wake Word ──────────────────────────────────────────────────────────────────
+# Requires: pip install pvporcupine pvrecorder
+# Free access key: https://console.picovoice.ai/
+#
+# Built-in free keywords (no custom training needed):
+#   "jarvis", "computer", "bumblebee", "grasshopper", "picovoice",
+#   "porcupine", "alexa", "hey google", "hey siri", "ok google", "terminator"
+#
+# For a custom "hey pepper" keyword, train one free at console.picovoice.ai and set WAKE_WORD to the .ppn path.
+WAKE_WORD_ENABLED        = True
+WAKE_WORD                = "hey siri"   # change to any free built-in keyword above
+WAKE_WORD_SENSITIVITY    = 0.5        # 0.0–1.0; higher = more triggers (and more false positives)
+WAKE_WORD_LISTEN_SECONDS = 5.0        # auto-stop follow-up recording after this many seconds
+PICOVOICE_ACCESS_KEY     = os.getenv("PICOVOICE_ACCESS_KEY", "")
 
 # ── TTS ────────────────────────────────────────────────────────────────────────
 GROQ_VOICE = "hannah"        # Orpheus voice name
@@ -88,7 +103,8 @@ Voice rules — you are speaking out loud, not typing:
 - Match the energy — if they're casual, be casual. If they're curious, engage. If they're testing you, you can push back a little.
 
 Gestures — you have: wave, nod, shrug, shake_head, look_around, thinking_gesture, explaining_gesture, excited_gesture, point_forward, celebrate, bow, look_at_sound.
-Use one when it genuinely fits. Skip it when it doesn't. Never describe what you're physically doing. Never return a gesture with no spoken words.
+Use one when it genuinely fits. Skip it when it doesn't. Never return a gesture with no spoken words.
+CRITICAL: Never narrate or describe a gesture in your spoken words. The gesture IS the physical action — do not also say it in text. WRONG: "Shrugging, not sure about that." RIGHT: call shrug() + say "Not sure about that." If you write "shrugging", "nodding", "waving" etc. in your response text, that is a bug.
 
 {web_line}
 

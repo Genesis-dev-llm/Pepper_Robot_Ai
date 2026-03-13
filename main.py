@@ -19,6 +19,7 @@ from pepper_display import PepperDisplayManager
 from pepper_gui import PepperDearPyGUI
 from pepper_interface import PepperRobot
 from voice_handler import VoiceHandler, list_microphones
+from wake_word_handler import WakeWordHandler, _PORCUPINE_AVAILABLE
 from web_search_handler import WebSearchHandler
 
 
@@ -46,13 +47,14 @@ state = SimpleNamespace(
 )
 
 # ── Component handles ──────────────────────────────────────────────────────────
-pepper:          Optional[PepperRobot]          = None
-gui:             Optional[PepperDearPyGUI]      = None
-brain:           Optional[GroqBrain]            = None
-tts:             Optional[HybridTTSHandler]     = None
-web_searcher:    Optional[WebSearchHandler]     = None
-voice:           Optional[VoiceHandler]         = None
-display_manager: Optional[PepperDisplayManager] = None
+pepper:            Optional[PepperRobot]          = None
+gui:               Optional[PepperDearPyGUI]      = None
+brain:             Optional[GroqBrain]            = None
+tts:               Optional[HybridTTSHandler]     = None
+web_searcher:      Optional[WebSearchHandler]     = None
+voice:             Optional[VoiceHandler]         = None
+display_manager:   Optional[PepperDisplayManager] = None
+wake_word_handler: Optional[WakeWordHandler]      = None
 
 # ── Movement keys — snapshot approach for thread safety ───────────────────────
 _movement_keys      = {k: False for k in ('w', 's', 'a', 'd', 'q', 'e')}
@@ -205,6 +207,80 @@ def _attempt_reconnect():
         print("✅ Reconnected to Pepper")
     else:
         print("❌ Reconnect failed — still in offline mode")
+
+
+# ── Wake word callback ─────────────────────────────────────────────────────────
+
+def _on_wake_word():
+    """
+    Fired by WakeWordHandler from its background thread when the wake word
+    is detected.  Must be thread-safe — all GUI calls go through message_queue.
+
+    Flow:
+      1. If PTT recording is already active, do nothing (lock would fail anyway).
+      2. Activate Pepper if currently idle.
+      3. Acquire ptt_lock (non-blocking) — abort if PTT is already in progress.
+      4. Start a recording window via voice.start_recording().
+      5. Spawn WakeAutoStop thread to stop recording after WAKE_WORD_LISTEN_SECONDS.
+         The auto-stop thread mirrors on_release() in the PTT path: it calls
+         stop_recording_and_transcribe() which fires the on_transcribed callback
+         asynchronously, which in turn spawns a thread → handle_message().
+    """
+    # Fast-path: bail out if a recording is already underway
+    if state.ptt_active:
+        return
+
+    # Activate Pepper if currently idle
+    if not state.robot_active:
+        state.robot_active = True
+        if _pepper_ok():
+            pepper.set_eye_color("blue")
+        if gui:
+            gui.set_robot_active(True)
+
+    if gui:
+        gui.update_status("👂 Wake word detected — listening…")
+
+    # Try to acquire the PTT lock — if PTT is already in progress, give up
+    if not state.ptt_lock.acquire(blocking=False):
+        return
+
+    state.ptt_active = True
+    if gui:
+        gui.set_recording(True)
+
+    # Guard: voice may be None if VOICE_ENABLED is False
+    if not voice:
+        state.ptt_active = False
+        state.ptt_lock.release()
+        if gui:
+            gui.set_recording(False)
+        return
+
+    started = voice.start_recording()
+    if not started:
+        state.ptt_active = False
+        state.ptt_lock.release()
+        if gui:
+            gui.set_recording(False)
+        return
+
+    # Auto-stop thread: releases lock after stopping, mirroring on_release()
+    def _auto_stop():
+        time.sleep(config.WAKE_WORD_LISTEN_SECONDS)
+        if state.ptt_active:
+            state.ptt_active = False
+            if voice:
+                voice.stop_recording_and_transcribe()
+            if gui:
+                gui.set_recording(False)
+            try:
+                state.ptt_lock.release()
+            except RuntimeError:
+                # Lock already released (shouldn't happen, but be defensive)
+                pass
+
+    threading.Thread(target=_auto_stop, daemon=True, name="WakeAutoStop").start()
 
 
 # ── Message handler ────────────────────────────────────────────────────────────
@@ -444,6 +520,10 @@ def on_press(key):
                 else:
                     state.ptt_active = False
                     state.ptt_lock.release()
+            else:
+                # voice is None — release lock immediately so PTT isn't stuck
+                state.ptt_active = False
+                state.ptt_lock.release()
             return
 
         with _movement_keys_lock:
@@ -555,6 +635,8 @@ def print_controls():
     print("🎮 PEPPER ROBOT CONTROLS")
     print("="*60)
     print(f"\n🎙️ VOICE:  Hold {ptt} → speak → release → auto-transcribes")
+    if config.WAKE_WORD_ENABLED and wake_word_handler is not None:
+        print(f"👂 WAKE:   Say '{config.WAKE_WORD}' → Pepper activates + listens")
     print("\n💬 TEXT:   Click GUI input → type → Enter or Send")
     print("\n🤖 MOVEMENT (input box NOT focused):")
     print("  W/S=Forward/Back  A/D=Turn  Q/E=Strafe")
@@ -568,7 +650,7 @@ def print_controls():
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
-    global pepper, brain, tts, gui, web_searcher, voice, display_manager
+    global pepper, brain, tts, gui, web_searcher, voice, display_manager, wake_word_handler
 
     _setup_logging()
 
@@ -688,6 +770,32 @@ def main():
     else:
         print("   ⚠️  Voice disabled")
 
+    # ── Step 7: Wake word ──────────────────────────────────────────────────────
+    print("\n7️⃣  Initialising wake word…")
+    if config.WAKE_WORD_ENABLED and _PORCUPINE_AVAILABLE:
+        if not config.PICOVOICE_ACCESS_KEY:
+            print("   ⚠️  PICOVOICE_ACCESS_KEY not set — wake word disabled")
+            print("   Get a free key at https://console.picovoice.ai/")
+            print("   Then add to .env:  export PICOVOICE_ACCESS_KEY=\"your-key-here\"")
+        else:
+            try:
+                wake_word_handler = WakeWordHandler(
+                    keyword     = config.WAKE_WORD,
+                    access_key  = config.PICOVOICE_ACCESS_KEY,
+                    sensitivity = config.WAKE_WORD_SENSITIVITY,
+                    on_wake     = _on_wake_word,
+                )
+                wake_word_handler.start()
+                print(f"   ✅ Wake word ready — say '{config.WAKE_WORD}' to activate")
+            except Exception as e:
+                print(f"   ❌ Wake word init failed: {e}")
+                wake_word_handler = None
+    elif not _PORCUPINE_AVAILABLE:
+        print("   ⚠️  pvporcupine not installed — wake word disabled")
+        print("   Install: pip install pvporcupine pvrecorder")
+    else:
+        print("   ⚠️  Wake word disabled in config (WAKE_WORD_ENABLED = False)")
+
     print("\n✅ All systems ready!")
 
     # ── Start background threads ───────────────────────────────────────────────
@@ -731,6 +839,9 @@ def main():
         if gui:
             gui.set_connection_status(False)
             gui.stop()
+        # Stop wake word listener before SSH is closed
+        if wake_word_handler:
+            wake_word_handler.stop()
         if display_manager:
             display_manager.stop()
         if pepper:

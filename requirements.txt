@@ -36,3 +36,10 @@ paramiko>=2.11.0
 # Tablet display — image processing for Pepper's chest tablet
 # Used by pepper_display.py to resize/letterbox/sharpen images.
 Pillow>=10.0.0
+
+# Wake Word Detection (OPTIONAL — required for hands-free "say jarvis to activate" mode)
+# Install: pip install pvporcupine pvrecorder
+# Free access key: https://console.picovoice.ai/
+# Without these, wake word is gracefully disabled; push-to-talk still works.
+pvporcupine>=3.0.0
+pvrecorder>=1.2.0
