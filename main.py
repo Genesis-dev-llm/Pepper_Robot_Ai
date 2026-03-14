@@ -21,6 +21,9 @@ from pepper_interface import PepperRobot
 from voice_handler import VoiceHandler, list_microphones
 from wake_word_handler import WakeWordHandler, _PORCUPINE_AVAILABLE
 from web_search_handler import WebSearchHandler
+from chat_logger import ChatLogger
+
+chat_log = ChatLogger()  # module-level so all functions can access it
 
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
@@ -257,7 +260,7 @@ def _on_wake_word():
             gui.set_recording(False)
         return
 
-    started = voice.start_recording()
+    started = voice.start_recording(vad_mode=True)
     if not started:
         state.ptt_active = False
         state.ptt_lock.release()
@@ -265,19 +268,23 @@ def _on_wake_word():
             gui.set_recording(False)
         return
 
-    # Auto-stop thread: releases lock after stopping, mirroring on_release()
+    # Auto-stop thread: polls until recording ends (VAD) or deadline reached (fallback).
+    # This ensures ptt_lock is always released regardless of how recording stopped.
     def _auto_stop():
-        time.sleep(config.WAKE_WORD_LISTEN_SECONDS)
+        deadline = time.time() + config.WAKE_WORD_LISTEN_SECONDS
+        while state.ptt_active and time.time() < deadline:
+            if not (voice and voice.is_recording):
+                break  # VAD already stopped it
+            time.sleep(0.1)
         if state.ptt_active:
             state.ptt_active = False
-            if voice:
+            if voice and voice.is_recording:
                 voice.stop_recording_and_transcribe()
             if gui:
                 gui.set_recording(False)
             try:
                 state.ptt_lock.release()
             except RuntimeError:
-                # Lock already released (shouldn't happen, but be defensive)
                 pass
 
     threading.Thread(target=_auto_stop, daemon=True, name="WakeAutoStop").start()
@@ -338,6 +345,7 @@ def _process_message(message: str):
                 gui.set_robot_active(False)
             return
 
+        chat_log.log_user(message)
         if gui:
             gui.update_status("Thinking…")
 
@@ -347,25 +355,16 @@ def _process_message(message: str):
         _think_ctx = pepper.thinking() if _pepper_ok() else nullcontext()
 
         with _think_ctx:
-            # Keyword fast-path: search before LLM if obvious
-            if config.USE_WEB_SEARCH and brain.needs_search(message):
-                if gui:
-                    gui.update_status("🔍 Searching…")
-                search_results = web_searcher.search(message)
-                response_text, function_calls = _retry(
-                    brain.chat_with_context,
-                    user_message=message,
-                    context=search_results,
-                )
-            else:
-                response_text, function_calls = _retry(brain.chat, message)
+            # Let the model decide: it will call web_search if it needs it,
+            # or ask a follow-up question if the query is too vague.
+            response_text, function_calls = _retry(brain.chat, message)
 
-        # Check if the model requested a web search as a function call
         search_query = _extract_search_call(function_calls)
         if search_query:
             if gui:
                 gui.update_status("🔍 Searching…")
             print(f"🔍 Model requested search: '{search_query}'")
+            chat_log.log_search(search_query)
             search_results = web_searcher.search(search_query)
             response_text, function_calls = _retry(
                 brain.chat_with_context,
@@ -376,6 +375,7 @@ def _process_message(message: str):
         gesture_callback, emotion = _parse_function_calls(function_calls)
 
         if response_text:
+            chat_log.log_pepper(response_text)
             if gui:
                 gui.add_pepper_message(response_text)
             _say(response_text, emotion=emotion, gesture_callback=gesture_callback)
@@ -673,7 +673,7 @@ def main():
     display_manager = PepperDisplayManager(pepper_ip=config.PEPPER_IP, port=8765)
     display_manager.set_tablet_fns(
         show_fn    = pepper.show_tablet_image,
-        webview_fn = pepper.show_tablet_webview,
+        webview_fn = pepper.open_browser,
         clear_fn   = pepper.clear_tablet,
     )
     display_manager.start()
@@ -686,12 +686,13 @@ def main():
 
     print("\n3️⃣  Initialising AI brain…")
     brain = GroqBrain(
-        api_key        = config.GROQ_API_KEY,
-        llm_model      = config.GROQ_LLM_MODEL,
-        whisper_model  = config.GROQ_WHISPER_MODEL,
-        system_prompt  = config.build_system_prompt(),
-        functions      = config.ROBOT_FUNCTIONS,
-        use_web_search = config.USE_WEB_SEARCH,
+        api_key         = config.GROQ_API_KEY,
+        llm_model       = config.GROQ_LLM_MODEL,
+        whisper_model   = config.GROQ_WHISPER_MODEL,
+        system_prompt   = "",  # built inside GroqBrain.__init__ based on model
+        functions       = config.ROBOT_FUNCTIONS,
+        use_web_search  = config.USE_WEB_SEARCH,
+        fallback_models = config.LLM_FALLBACK_MODELS,
     )
 
     print("\n4️⃣  Initialising TTS…")
@@ -815,7 +816,8 @@ def main():
         action_callback        = on_action,
         display_callback       = display_manager.show_image if display_manager else None,
         clear_display_callback = display_manager.clear_display if display_manager else None,
-        webview_callback       = lambda url: pepper.show_tablet_webview(url) if _pepper_ok() else None,
+        webview_callback       = lambda url: pepper.open_browser(url) if _pepper_ok() else None,
+        free_browse_callback   = lambda: pepper.free_tablet() if _pepper_ok() else None,
         start_camera_callback  = lambda: threading.Thread(
             target=_start_camera_stream, daemon=True, name="CameraStart"
         ).start(),

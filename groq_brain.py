@@ -11,6 +11,7 @@ Changes from previous version:
 - _clean_response_text now uses a permissive regex for function tag stripping
   that handles malformed tags where the model omits the closing '>' on the
   opening tag (e.g. <function=express_emotion{"emotion":"curious"}</function>).
+- chat_with_context retries without tools on Groq 400 (malformed tool call).
 """
 
 import json
@@ -63,10 +64,60 @@ def _clean_response_text(text: str) -> str:
     text = re.sub(r"<tool[^>]*>.*?</tool>", "", text, flags=re.DOTALL)
     # Asterisk stage directions
     text = re.sub(r"\*[^*]+\*", "", text)
+    # Strip "call gesture_name()" / "call gesture_name(...)" lines the model
+    # sometimes emits as plain text instead of using the tool call API.
+    text = re.sub(r"(?i)^\s*call\s+\w+\([^)]*\)\s*$", "", text, flags=re.MULTILINE)
+    # Strip (stage directions in parentheses) — model sometimes uses these instead of asterisks
+    text = re.sub(r"\([^)]{1,60}\)", "", text)
+    # Strip <web_search> XML tags the model emits when it can't use the tool API
+    # e.g. <web_search> {"query": "..."} </web_search>
+    text = re.sub(r"<web_search>.*?</web_search>", "", text, flags=re.DOTALL)
+    # Also strip unclosed <web_search> fragments
+    text = re.sub(r"<web_search>[^<]*", "", text)
     # Bare gesture names on their own line (derived from config — single source of truth)
     lines = text.splitlines()
     lines = [l for l in lines if l.strip().lower() not in config.GESTURE_NAMES]
     return "\n".join(lines).strip()
+
+
+def _extract_web_search_tag(text: str) -> Optional[str]:
+    """
+    Extract a search query from a <web_search> tag the model emitted as plain text.
+    Handles both {"query": "..."} and {"search_term": "..."} key names.
+    e.g. <web_search> {"query": "news March 13 2026"} </web_search>
+    """
+    match = re.search(r'<web_search[^>]*>(.*?)</web_search>', text, re.DOTALL)
+    if not match:
+        match = re.search(r'<web_search[^>]*>([^<]+)', text)
+    if not match:
+        return None
+    body = match.group(1).strip()
+    # Try to parse JSON body
+    q = re.search(r'"(?:query|search_term|q)"\s*:\s*"([^"]+)"', body)
+    if q:
+        return q.group(1)
+    # Fallback: body itself might just be the query string
+    if body and not body.startswith("{"):
+        return body.strip()
+    return None
+
+
+def _extract_query_from_400(error_str: str) -> Optional[str]:
+    """
+    Parse the search query out of a Groq 400 error where the model malformed
+    the tool name, e.g.: attempted to call tool 'web_search={"query": "..."}'
+
+    Returns the query string if found, None otherwise.
+    """
+    # Pattern: web_search={"query": "..."} or web_search{"query": "..."}
+    match = re.search(r'web_search[=\s]*\{[^}]*"query"\s*:\s*"([^"]+)"', error_str)
+    if match:
+        return match.group(1)
+    # Fallback: <function=web_search={"query": "..."}>
+    match = re.search(r'<function=web_search[^>]*"query"\s*:\s*"([^"]+)"', error_str)
+    if match:
+        return match.group(1)
+    return None
 
 
 def _sanitize_history(history: List[Dict]) -> List[Dict]:
@@ -84,25 +135,79 @@ def _sanitize_history(history: List[Dict]) -> List[Dict]:
 class GroqBrain:
     def __init__(
         self,
-        api_key:       str,
-        llm_model:     str,
-        whisper_model: str,
-        system_prompt: str,
-        functions:     List[Dict],
+        api_key:        str,
+        llm_model:      str,
+        whisper_model:  str,
+        system_prompt:  str,
+        functions:      List[Dict],
         use_web_search: bool = False,
+        fallback_models: Optional[List[str]] = None,
     ):
-        self.client        = Groq(api_key=api_key)
-        self.llm_model     = llm_model
-        self.whisper_model = whisper_model
-        self.system_prompt = system_prompt
-        self.functions     = functions
+        self.client         = Groq(api_key=api_key)
+        self.whisper_model  = whisper_model
         self.use_web_search = use_web_search
+
+        # Full model chain: primary + fallbacks
+        self._model_chain  = [llm_model] + (fallback_models or [])
+        self._model_index  = 0
+        self.llm_model     = self._model_chain[0]
+
+        # gesture-only functions (no web_search) — used for compound models
+        self._gesture_functions = [
+            f for f in functions
+            if f.get("function", {}).get("name") != "web_search"
+        ]
+        # full functions including web_search — used for llama fallback
+        self._all_functions = functions
+
+        # Build system prompt based on current model
+        self.system_prompt = config.build_system_prompt(
+            native_search=self._is_compound()
+        )
 
         self.conversation_history: List[Dict] = []
         self._history_lock = threading.Lock()
 
         print(f"🧠 Groq Brain ready — {self.llm_model} "
-              f"({'web search ON' if use_web_search else 'web search OFF'})")
+              f"({'native search' if self._is_compound() else 'web search ON' if use_web_search else 'web search OFF'})")
+        if self._model_chain[1:]:
+            print(f"   Fallback chain: {' → '.join(self._model_chain[1:])}")
+
+    # ── Model fallback ────────────────────────────────────────────────────────
+
+    def _is_compound(self, model: Optional[str] = None) -> bool:
+        """Returns True if the given (or current) model has native built-in search."""
+        return (model or self.llm_model) in config.COMPOUND_MODELS
+
+    @property
+    def functions(self) -> List[Dict]:
+        """
+        Return appropriate tool list for the current model.
+        Compound: gesture tools only — it has native search built in, so passing
+          our web_search definition causes a conflict (two search tools) and 400s.
+        Llama fallback: gesture tools + web_search as normal.
+        """
+        if self._is_compound():
+            return self._gesture_functions  # gestures only, no web_search conflict
+        return self._all_functions if self.use_web_search else self._gesture_functions
+
+    def _advance_model(self) -> bool:
+        """
+        Step to the next model in the fallback chain.
+        Returns True if a fallback is available, False if chain is exhausted.
+        """
+        if self._model_index >= len(self._model_chain) - 1:
+            print("❌ All models in fallback chain exhausted")
+            return False
+        self._model_index += 1
+        self.llm_model = self._model_chain[self._model_index]
+        # Rebuild system prompt for new model type
+        self.system_prompt = config.build_system_prompt(
+            native_search=self._is_compound()
+        )
+        print(f"⚠️  Falling back to {self.llm_model} "
+              f"({'native search' if self._is_compound() else 'manual search'})")
+        return True
 
     # ── STT ───────────────────────────────────────────────────────────────────
 
@@ -137,18 +242,40 @@ class GroqBrain:
                 + [{"role": "user", "content": user_message}]
             )
 
-            response = self.client.chat.completions.create(
-                model       = self.llm_model,
-                messages    = messages,
-                tools       = self.functions,
-                tool_choice = "auto",
-                temperature = 0.7,
-                max_tokens  = 150,
-            )
+            # Try current model, fall back on 429
+            response = None
+            for _attempt in range(len(self._model_chain)):
+                try:
+                    _tools = self.functions
+                    _kwargs = dict(
+                        model       = self.llm_model,
+                        messages    = messages,
+                        temperature = 0.7,
+                        max_tokens  = 400,
+                    )
+                    if _tools:
+                        _kwargs["tools"]       = _tools
+                        _kwargs["tool_choice"] = "auto"
+                    response = self.client.chat.completions.create(**_kwargs)
+                    break  # success
+                except Exception as _e:
+                    if ("429" in str(_e) or "rate_limit" in str(_e).lower()) and self._advance_model():
+                        continue  # retry with next model
+                    raise  # non-429 or chain exhausted — let outer handler deal with it
+            if response is None:
+                return None, None
 
             message        = response.choices[0].message
-            response_text  = _clean_response_text(message.content or "")
+            raw_text       = message.content or ""
+            response_text  = _clean_response_text(raw_text)
             function_calls = _parse_tool_calls(message)
+
+            # Model output <web_search> as plain text with no tool call
+            if not function_calls and not response_text and self.use_web_search:
+                search_query = _extract_web_search_tag(raw_text)
+                if search_query:
+                    print(f"⚠️  <web_search> tag in response — re-routing: '{search_query}'")
+                    return None, [{"name": "web_search", "arguments": {"query": search_query}}]
 
             if function_calls and not response_text:
                 response_text = self._get_verbal_response(messages, function_calls)
@@ -163,6 +290,42 @@ class GroqBrain:
             return response_text, function_calls or None
 
         except Exception as e:
+            # Groq 400: model malformed the web_search tool call, e.g.
+            # <function=web_search={"query": "..."}> — the query is embedded
+            # in the tool name. Extract it and do the search properly.
+            if "400" in str(e) or "tool_use_failed" in str(e) or "tool call validation" in str(e):
+                query = _extract_query_from_400(str(e))
+                if query and self.use_web_search:
+                    print(f"⚠️  Malformed search tool call — extracting query: '{query}'")
+                    return None, [{"name": "web_search", "arguments": {"query": query}}]
+                # No query extractable — retry without tools
+                print(f"⚠️  Tool call malformed in chat() — retrying without tools")
+                try:
+                    response = self.client.chat.completions.create(
+                        model       = self.llm_model,
+                        messages    = messages,
+                        temperature = 0.7,
+                        max_tokens  = 400,
+                    )
+                    raw_text      = response.choices[0].message.content or ""
+                    response_text = _clean_response_text(raw_text)
+
+                    if not response_text and self.use_web_search:
+                        search_query = _extract_web_search_tag(raw_text)
+                        if search_query:
+                            print(f"⚠️  <web_search> tag in chat retry — re-routing: '{search_query}'")
+                            return None, [{"name": "web_search", "arguments": {"query": search_query}}]
+
+                    if response_text:
+                        with self._history_lock:
+                            self.conversation_history.append({"role": "user",      "content": user_message})
+                            self.conversation_history.append({"role": "assistant", "content": response_text})
+                            self._trim_history()
+                        self._log(response_text, [], tag="retry")
+                    return response_text, None
+                except Exception as e2:
+                    print(f"❌ Chat retry failed: {e2}")
+                    return None, None
             print(f"❌ Chat error: {e}")
             import traceback; traceback.print_exc()
             return None, None
@@ -172,24 +335,47 @@ class GroqBrain:
         user_message: str,
         context: str,
     ) -> Tuple[Optional[str], Optional[List[Dict]]]:
-        """Single LLM call with injected search/tool context."""
-        try:
-            messages = (
-                [{"role": "system", "content": self.system_prompt}]
-                + _sanitize_history(self.conversation_history)
-                + [{"role": "system", "content":
-                    "[Search result — use this to answer; do NOT repeat verbatim]:\n" + context}]
-                + [{"role": "user", "content": user_message}]
-            )
+        """
+        Single LLM call with injected search/tool context.
 
-            response = self.client.chat.completions.create(
-                model       = self.llm_model,
-                messages    = messages,
-                tools       = self.functions,
-                tool_choice = "auto",
-                temperature = 0.7,
-                max_tokens  = 150,
-            )
+        If Groq rejects with a 400 (malformed tool call in model output),
+        retries once without tools to still get a spoken response.
+        """
+        messages = (
+            [{"role": "system", "content": self.system_prompt}]
+            + _sanitize_history(self.conversation_history)
+            + [{"role": "system", "content":
+                "[Search result — use this to answer; do NOT repeat verbatim]:\n" + context}]
+            + [{"role": "user", "content": user_message}]
+        )
+
+        # Exclude web_search from tools — results are already injected above.
+        # This prevents the model malforming a search tool call on the context call.
+        gesture_tools = [f for f in self.functions
+                         if f.get("function", {}).get("name") != "web_search"]
+
+        # Try current model, fall back on 429
+        response = None
+        for _attempt in range(len(self._model_chain)):
+            try:
+                _kwargs = dict(
+                    model       = self.llm_model,
+                    messages    = messages,
+                    temperature = 0.7,
+                    max_tokens  = 400,
+                )
+                if gesture_tools:
+                    _kwargs["tools"]       = gesture_tools
+                    _kwargs["tool_choice"] = "auto"
+                response = self.client.chat.completions.create(**_kwargs)
+                break
+            except Exception as _e:
+                if ("429" in str(_e) or "rate_limit" in str(_e).lower()) and self._advance_model():
+                    continue
+                raise
+        try:
+            if response is None:
+                return None, None
 
             message        = response.choices[0].message
             response_text  = _clean_response_text(message.content or "")
@@ -208,6 +394,39 @@ class GroqBrain:
             return response_text, function_calls or None
 
         except Exception as e:
+            # Groq 400: model generated a malformed tool call (e.g. express_emotion{...}
+            # embedded in the tool name). Retry without tools to still get a response.
+            if "400" in str(e) or "tool_use_failed" in str(e) or "tool call validation" in str(e):
+                print(f"⚠️  Tool call malformed — retrying without tools")
+                try:
+                    response = self.client.chat.completions.create(
+                        model       = self.llm_model,
+                        messages    = messages,
+                        temperature = 0.7,
+                        max_tokens  = 400,
+                    )
+                    raw_text      = response.choices[0].message.content or ""
+                    response_text = _clean_response_text(raw_text)
+
+                    # Model output a <web_search> tag as plain text instead of a tool call.
+                    # Extract the query and hand it back as a tool call so main.py re-searches.
+                    if not response_text and self.use_web_search:
+                        search_query = _extract_web_search_tag(raw_text)
+                        if search_query:
+                            print(f"⚠️  <web_search> tag in ctx-retry — re-routing as tool call: '{search_query}'")
+                            return None, [{"name": "web_search", "arguments": {"query": search_query}}]
+
+                    if response_text:
+                        with self._history_lock:
+                            self.conversation_history.append({"role": "user",      "content": user_message})
+                            self.conversation_history.append({"role": "assistant", "content": response_text})
+                            self._trim_history()
+                        self._log(response_text, [], tag="ctx-retry")
+                    return response_text, None
+                except Exception as e2:
+                    print(f"❌ chat_with_context retry failed: {e2}")
+                    return None, None
+
             print(f"❌ chat_with_context error: {e}")
             import traceback; traceback.print_exc()
             return None, None
@@ -229,7 +448,7 @@ class GroqBrain:
                     "content": context + "Now provide your spoken response. Keep it 1-3 sentences.",
                 }],
                 temperature = 0.7,
-                max_tokens  = 150,
+                max_tokens  = 400,
             )
             text = _clean_response_text(response.choices[0].message.content or "")
             if text:

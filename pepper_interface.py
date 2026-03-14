@@ -20,6 +20,12 @@ Latest changes:
   path. The 30s keepalive already handles silent drops; the probe was blocking
   for up to 2s on every audio playback call. SFTP failures now surface
   reactively through the existing single-retry path.
+- open_browser: new method — loadUrl() + showWebview() + enableTabletAccess()
+  for a fully interactive browser with touch/typing support.
+- free_tablet: new method — hideWebview() to exit NAOqi kiosk and return to
+  Android home screen / Chrome.
+- show_tablet_webview now also calls enableTabletAccess() so all webview
+  calls are interactive by default.
 """
 
 import logging
@@ -263,11 +269,6 @@ class PepperRobot:
         status_callback:   Optional[Callable[[str], None]] = None,
         gesture_callback:  Optional[Callable[[], None]]    = None,
     ) -> bool:
-        """
-        Full pipeline: TTS generation → SSH transfer → NAOqi playback.
-        gesture_callback fires right before audio starts playing so the
-        gesture is synchronized with speech onset.
-        """
         audio_path = None
         try:
             if status_callback:
@@ -285,7 +286,6 @@ class PepperRobot:
                     return True
 
             print("↩️  Falling back to built-in NAOqi TTS")
-            # Fire gesture before built-in TTS too
             if gesture_callback:
                 try:
                     gesture_callback()
@@ -302,14 +302,6 @@ class PepperRobot:
                     pass
 
     def _ensure_ssh(self) -> bool:
-        """
-        Ensure SSH is alive. Uses transport.is_active() as a fast flag check.
-        The 30s keepalive (set_keepalive) already handles silent drops, so
-        we no longer run exec_command("echo ok") on every call — that was
-        blocking for up to 2s on the hot path before any audio transferred.
-        SFTP failures are surfaced reactively through the existing retry in
-        _transfer_to_robot.
-        """
         if not _PARAMIKO_AVAILABLE:
             return False
 
@@ -336,7 +328,6 @@ class PepperRobot:
                 password = self.ssh_password,
                 timeout  = 5,
             )
-            # Keepalive keeps idle sessions alive between audio clips
             transport = client.get_transport()
             if transport:
                 transport.set_keepalive(config.SSH_KEEPALIVE_INTERVAL)
@@ -349,7 +340,6 @@ class PepperRobot:
             return False
 
     def _transfer_to_robot(self, local_path: str) -> Optional[str]:
-        """Transfer audio via SFTP. No speech lock held during transfer."""
         if not _PARAMIKO_AVAILABLE:
             return None
         remote_path = f"/tmp/{os.path.basename(local_path)}"
@@ -362,7 +352,6 @@ class PepperRobot:
             return remote_path
         except Exception as e:
             logging.warning("SFTP transfer failed: %s — retrying", e)
-            # One retry with a fresh SSH connection
             self._ssh_client = None
             try:
                 if not self._ensure_ssh():
@@ -383,10 +372,6 @@ class PepperRobot:
         gesture_callback: Optional[Callable[[], None]]    = None,
         lock_timeout:     float = 2.0,
     ) -> bool:
-        """
-        Transfer audio to Pepper and play via ALAudioPlayer.
-        gesture_callback fires right before player.play() — synchronized with speech.
-        """
         if not _PARAMIKO_AVAILABLE:
             return False
 
@@ -410,14 +395,12 @@ class PepperRobot:
             player  = self.session.service("ALAudioPlayer")
             file_id = player.loadFile(remote_path)
 
-            # Fire the intentional gesture right before audio starts
             if gesture_callback:
                 try:
                     gesture_callback()
                 except Exception as e:
                     logging.warning("gesture_callback error: %s", e)
 
-            # Start background random animation loop
             self._is_speaking_hq = True
             anim_thread = threading.Thread(
                 target=self._hq_speech_animation_loop,
@@ -427,7 +410,7 @@ class PepperRobot:
             self._anim_thread = anim_thread
             anim_thread.start()
 
-            player.play(file_id)   # blocks until done
+            player.play(file_id)
             return True
 
         except Exception as e:
@@ -451,7 +434,6 @@ class PepperRobot:
                 pass
 
     def _hq_speech_animation_loop(self):
-        """Random background gestures during HQ audio playback. Expanded pool."""
         gesture_fns = [
             self.nod, self.explaining_gesture, self.thinking_gesture,
             self.look_around, self.wave, self.celebrate,
@@ -695,14 +677,13 @@ class PepperRobot:
         "off":    0x00000000,
     }
 
-    # Each emotion has a visually distinct color
     EMOTION_COLOUR_MAP = {
-        "happy":     "yellow",   # warm, positive
-        "sad":       "blue",     # classic sad blue
-        "excited":   "green",    # energetic
-        "curious":   "cyan",     # inquisitive, different from sad
-        "surprised": "white",    # bright/startled
-        "neutral":   "blue",     # default
+        "happy":     "yellow",
+        "sad":       "blue",
+        "excited":   "green",
+        "curious":   "cyan",
+        "surprised": "white",
+        "neutral":   "blue",
     }
 
     def set_eye_color(self, color: str):
@@ -727,19 +708,13 @@ class PepperRobot:
 
     @staticmethod
     def _valid_audio(path: str) -> bool:
-        """
-        Validate audio file by checking magic bytes, not just size.
-        Catches truncated files or HTML error pages written to disk.
-        """
         try:
             if not os.path.exists(path) or os.path.getsize(path) < 4:
                 return False
             with open(path, "rb") as f:
                 header = f.read(12)
-            # WAV: RIFF....WAVE
             if header[:4] == b"RIFF" and header[8:12] == b"WAVE":
                 return True
-            # MP3: ID3 tag or sync frame (0xFF 0xFB / 0xFF 0xFA / 0xFF 0xF3)
             if header[:3] == b"ID3":
                 return True
             if len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0:
@@ -764,16 +739,54 @@ class PepperRobot:
 
         Correct NAOqi call order: loadUrl() loads the page into the browser
         engine, then showWebview() (no argument) brings the webview panel into
-        view.  Calling showWebview(url) directly is incorrect per the SDK spec
-        and may silently fail on some firmware versions.
+        view.  enableTabletAccess() is called last to unlock touch input so
+        the user can interact with the page.
         """
         if not self.tablet:
             return
         try:
             self.tablet.loadUrl(url)
             self.tablet.showWebview()
+            self.tablet.enableTabletAccess()
         except Exception as e:
             logging.warning("show_tablet_webview: %s", e)
+
+    def open_browser(self, url: str):
+        """
+        Open a fully interactive browser on Pepper's tablet.
+
+        Same as show_tablet_webview — loadUrl() + showWebview() +
+        enableTabletAccess() — but explicitly named for interactive use.
+        The user can tap links, type in the address bar, scroll, and use
+        YouTube, Google, or any other site normally.
+        """
+        if not self.tablet:
+            logging.warning("open_browser: tablet service not available")
+            return
+        try:
+            self.tablet.loadUrl(url)
+            self.tablet.showWebview()
+            self.tablet.enableTabletAccess()
+            print(f"🌐 Tablet browser opened: {url}")
+        except Exception as e:
+            logging.warning("open_browser: %s", e)
+
+    def free_tablet(self):
+        """
+        Exit the NAOqi webview kiosk and return to Android home screen.
+
+        Calling hideWebview() drops out of the NAOqi-controlled webview
+        and lands on the Android launcher, giving access to Chrome and
+        any other installed apps. Call open_browser() to return to a
+        managed URL.
+        """
+        if not self.tablet:
+            return
+        try:
+            self.tablet.hideWebview()
+            print("🏠 Tablet freed — Android home screen")
+        except Exception as e:
+            logging.warning("free_tablet: %s", e)
 
     def clear_tablet(self):
         if not self.tablet:
@@ -788,17 +801,6 @@ class PepperRobot:
     # ── Camera → Tablet streaming ─────────────────────────────────────────────
 
     def start_tablet_camera_stream(self) -> bool:
-        """
-        Deploy camera_stream.py to Pepper via SFTP and start it as a
-        background process, then point the tablet browser at the MJPEG page.
-
-        The script runs on Pepper's head CPU, subscribes to ALVideoDevice
-        locally (127.0.0.1), and serves MJPEG at port 8080.  The tablet
-        reaches it over the internal USB link at 198.18.0.1:8080 — no WiFi.
-
-        Returns True if the stream started and the tablet was pointed at it.
-        Returns False with a printed reason on any failure.
-        """
         if not _PARAMIKO_AVAILABLE:
             print("❌ Camera stream: paramiko not installed")
             return False
@@ -825,7 +827,6 @@ class PepperRobot:
             print("❌ Camera stream: SFTP upload failed: {0}".format(e))
             return False
 
-        # Kill any stale instance then launch fresh in the background
         launch_cmd = (
             "pkill -f camera_stream.py 2>/dev/null; sleep 0.3; "
             "python {script} > /tmp/camera_stream.log 2>&1 &"
@@ -836,7 +837,6 @@ class PepperRobot:
             print("❌ Camera stream: launch command failed: {0}".format(e))
             return False
 
-        # Give the server time to bind port 8080 before pointing the tablet at it
         print("⏳ Waiting for camera server to start…")
         time.sleep(2.0)
 
@@ -851,10 +851,6 @@ class PepperRobot:
             return False
 
     def stop_tablet_camera_stream(self):
-        """
-        Kill the MJPEG server process on Pepper and clear the tablet display.
-        Safe to call even if the stream was never started.
-        """
         if self._ssh_client:
             try:
                 self._ssh_client.exec_command("pkill -f camera_stream.py || true")
@@ -862,5 +858,4 @@ class PepperRobot:
             except Exception as e:
                 logging.warning("stop_tablet_camera_stream kill failed: %s", e)
 
-        # Always clear the tablet regardless of SSH state
         self.clear_tablet()

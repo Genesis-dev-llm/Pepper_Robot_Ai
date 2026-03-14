@@ -10,7 +10,7 @@ Changes from original:
 import concurrent.futures
 from typing import Dict, List
 
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 
 class WebSearchHandler:

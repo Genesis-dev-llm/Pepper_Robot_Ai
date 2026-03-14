@@ -12,6 +12,9 @@ Fixes from previous version:
   can display which tier is active.
 - _schedule_midnight_reset(): sets a threading.Timer to auto-reset daily
   limit flags at midnight. Called once at init.
+- play_audio: fixed static noise when playing Edge TTS MP3 files.
+  aplay only handles WAV/PCM — routing MP3 files to mpg123/ffplay/paplay
+  instead. aplay is now only used for .wav files.
 """
 
 import asyncio
@@ -164,12 +167,33 @@ class HybridTTSHandler:
         return None
 
     def play_audio(self, audio_file: str):
-        for player, args in [
-            ("aplay",   [audio_file]),
-            ("mpg123",  [audio_file]),
-            ("ffplay",  ["-nodisp", "-autoexit", "-loglevel", "quiet", audio_file]),
-            ("paplay",  [audio_file]),
-        ]:
+        """
+        Play an audio file using the best available player.
+
+        aplay only handles WAV/PCM — feeding it an MP3 produces static.
+        Route by extension:
+          .wav  → aplay (then ffplay/paplay as fallback)
+          .mp3  → mpg123 / ffplay / paplay (skip aplay entirely)
+        """
+        ext = os.path.splitext(audio_file)[1].lower()
+        is_wav = ext == ".wav"
+
+        if is_wav:
+            players = [
+                ("aplay",  [audio_file]),
+                ("ffplay", ["-nodisp", "-autoexit", "-loglevel", "quiet", audio_file]),
+                ("paplay", [audio_file]),
+            ]
+        else:
+            # MP3 / unknown — skip aplay which would play as static
+            players = [
+                ("mpg123",  ["-q", audio_file]),
+                ("ffplay",  ["-nodisp", "-autoexit", "-loglevel", "quiet", audio_file]),
+                ("paplay",  [audio_file]),
+                ("cvlc",    ["--play-and-exit", "--quiet", audio_file]),
+            ]
+
+        for player, args in players:
             try:
                 subprocess.run(
                     [player] + args,
@@ -180,7 +204,9 @@ class HybridTTSHandler:
                 return
             except (subprocess.CalledProcessError, FileNotFoundError):
                 continue
-        print("⚠️  No audio player found (install aplay, mpg123, or ffplay)")
+
+        print("⚠️  No audio player found for MP3 — install mpg123 or ffmpeg")
+        print("   Ubuntu: sudo apt install mpg123")
 
     def speak_and_play(self, text: str, emotion: Optional[str] = None) -> bool:
         path = self.speak(text, emotion=emotion)

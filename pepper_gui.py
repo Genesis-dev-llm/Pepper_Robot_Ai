@@ -12,8 +12,11 @@ Changes from previous version:
 
 Latest changes:
 - Tablet Display panel now has two additional sections:
-    1. Web Browser: URL input + Browse + Hide Browser buttons.
-       Wired to webview_callback(url) / clear_display_callback().
+    1. Web Browser: URL input + Browse + Free Browse + Hide Browser buttons.
+       Wired to webview_callback(url) / free_browse_callback() /
+       clear_display_callback().
+       "Free Browse" calls free_browse_callback() which exits the NAOqi kiosk
+       and drops to the Android home screen / Chrome.
     2. Camera Stream: Start/Stop toggle button + status indicator.
        Wired to start_camera_callback() / stop_camera_callback().
        start_camera_callback is expected to be non-blocking (caller
@@ -78,6 +81,7 @@ class PepperDearPyGUI:
         display_callback       = None,
         clear_display_callback = None,
         webview_callback       = None,
+        free_browse_callback   = None,
         start_camera_callback  = None,
         stop_camera_callback   = None,
     ):
@@ -87,6 +91,7 @@ class PepperDearPyGUI:
         self.display_callback       = display_callback
         self.clear_display_callback = clear_display_callback
         self.webview_callback       = webview_callback
+        self.free_browse_callback   = free_browse_callback
         self.start_camera_callback  = start_camera_callback
         self.stop_camera_callback   = stop_camera_callback
         self.is_running             = False
@@ -290,17 +295,20 @@ class PepperDearPyGUI:
                     dpg.add_input_text(
                         tag="webview_url_input",
                         hint="https://…",
-                        width=-220,
+                        width=-340,
                     )
                     dpg.add_spacer(width=6)
-                    dpg.add_button(label="Browse", width=100,
+                    dpg.add_button(label="Browse", width=90,
                                    callback=self._on_browse)
                     dpg.add_spacer(width=6)
-                    dpg.add_button(label="Hide Browser", width=100,
+                    dpg.add_button(label="🏠 Free Browse", width=110,
+                                   callback=self._on_free_browse)
+                    dpg.add_spacer(width=6)
+                    dpg.add_button(label="Hide", width=60,
                                    callback=self._on_hide_browser)
                 dpg.add_spacer(height=2)
                 dpg.add_text(
-                    "Enter a URL and tap Browse to open it on Pepper's tablet.",
+                    "Browse: load a URL  |  Free Browse: exit to Android home / Chrome  |  Hide: close webview",
                     color=(120, 120, 120),
                 )
 
@@ -507,7 +515,6 @@ class PepperDearPyGUI:
             return
         if not url:
             return
-        # Prepend https:// if the user left off the scheme
         if not url.startswith("http://") and not url.startswith("https://"):
             url = "https://" + url
             try:
@@ -516,6 +523,14 @@ class PepperDearPyGUI:
                 pass
         if self.webview_callback:
             self.webview_callback(url)
+
+    def _on_free_browse(self):
+        """
+        Exit the NAOqi webview kiosk → Android home screen / Chrome.
+        Calls free_browse_callback() which maps to pepper.free_tablet().
+        """
+        if self.free_browse_callback:
+            self.free_browse_callback()
 
     def _on_hide_browser(self):
         """Hide the webview — delegates to the existing clear_display path."""
@@ -526,15 +541,10 @@ class PepperDearPyGUI:
 
     def _on_camera_toggle(self):
         if self._camera_streaming:
-            # Stop path is instant — kill + clear tablet, no sleep.
-            # Always reset the UI immediately; _stop_camera_stream in main.py
-            # also calls update_camera_status(False) — double update is harmless.
             if self.stop_camera_callback:
                 self.stop_camera_callback()
             self.update_camera_status(False)
         else:
-            # Disable button while starting to prevent double-clicks.
-            # start_camera_callback is non-blocking — main.py wraps it in a thread.
             try:
                 dpg.configure_item("camera_toggle_btn",
                                    label="⏳ Starting…",

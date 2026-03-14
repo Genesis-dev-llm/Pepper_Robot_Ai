@@ -8,6 +8,10 @@ Changes from previous version:
   RMS value so the GUI can show a live audio level meter.
 - Thread spawning for transcription/message dispatch is handled in main.py;
   this module only delivers the transcribed text via on_transcribed.
+- vad_mode: when start_recording(vad_mode=True) is called and webrtcvad is
+  installed, a background thread monitors audio in 20ms frames and triggers
+  auto-stop once silence follows speech for VAD_SILENCE_SECONDS. Falls back
+  to timer-based stop if webrtcvad is not installed.
 """
 
 import os
@@ -21,6 +25,14 @@ import sounddevice as sd
 import soundfile as sf
 
 import config
+
+try:
+    import webrtcvad
+    _WEBRTCVAD_AVAILABLE = True
+except ImportError:
+    _WEBRTCVAD_AVAILABLE = False
+    print("ℹ️  webrtcvad not installed — wake word will use timer-based stop")
+    print("   Install: pip install webrtcvad")
 
 
 class VoiceHandler:
@@ -63,6 +75,7 @@ class VoiceHandler:
         self._audio_chunks: list = []
         self._stream: Optional[sd.InputStream] = None
         self._auto_stop_timer: Optional[threading.Timer] = None
+        self._vad_thread: Optional[threading.Thread] = None
 
         # Level meter update interval (seconds)
         self._level_timer: Optional[threading.Timer] = None
@@ -78,7 +91,17 @@ class VoiceHandler:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def start_recording(self) -> bool:
+    def start_recording(self, vad_mode: bool = False) -> bool:
+        """
+        Start recording from the default microphone.
+
+        Args:
+            vad_mode: When True and webrtcvad is installed, recording stops
+                      automatically once silence follows speech for
+                      config.VAD_SILENCE_SECONDS. Falls back to timer if
+                      webrtcvad is unavailable. PTT should always pass
+                      vad_mode=False (default).
+        """
         with self._lock:
             if self._is_recording:
                 return False
@@ -101,14 +124,28 @@ class VoiceHandler:
             )
             self._stream.start()
 
+            # Hard cap — always active regardless of vad_mode
             self._auto_stop_timer = threading.Timer(self.max_duration, self._auto_stop)
             self._auto_stop_timer.daemon = True
             self._auto_stop_timer.start()
 
+            # VAD monitor — only when requested and library is available
+            if vad_mode and _WEBRTCVAD_AVAILABLE:
+                self._vad_thread = threading.Thread(
+                    target=self._vad_monitor,
+                    daemon=True,
+                    name="VADMonitor",
+                )
+                self._vad_thread.start()
+            elif vad_mode:
+                # webrtcvad not installed — caller's timer acts as fallback
+                pass
+
             # Start level meter updates
             self._schedule_level_update()
 
-            print(f"🎙️ Recording started (max {self.max_duration}s)")
+            mode_label = " (VAD)" if vad_mode and _WEBRTCVAD_AVAILABLE else ""
+            print(f"🎙️ Recording started{mode_label} (max {self.max_duration}s)")
             if self.on_recording_start:
                 self.on_recording_start()
             return True
@@ -137,6 +174,66 @@ class VoiceHandler:
     def is_recording(self) -> bool:
         with self._lock:
             return self._is_recording
+
+    # ── VAD monitor ────────────────────────────────────────────────────────────
+
+    def _vad_monitor(self):
+        """
+        Background thread: monitors incoming audio and stops recording once
+        silence follows speech for config.VAD_SILENCE_SECONDS.
+
+        webrtcvad requires 16-bit PCM in specific frame sizes. At 16kHz:
+          10ms = 160 samples, 20ms = 320 samples, 30ms = 480 samples.
+        We use 20ms frames as a good balance of responsiveness and accuracy.
+
+        Float32 chunks from sounddevice are converted to int16 on the fly.
+        A rolling buffer handles alignment between chunk boundaries and frames.
+        """
+        vad = webrtcvad.Vad(config.VAD_AGGRESSIVENESS)
+
+        frame_ms      = 20                                         # ms per frame
+        frame_samples = int(self.sample_rate * frame_ms / 1000)   # 320 at 16kHz
+        frame_bytes   = frame_samples * 2                         # int16 = 2 bytes
+
+        buffer: bytes  = b""
+        chunk_index    = 0
+        speech_detected = False
+        silence_start: Optional[float] = None
+
+        while True:
+            with self._lock:
+                if not self._is_recording:
+                    return
+                new_chunks = self._audio_chunks[chunk_index:]
+                chunk_index = len(self._audio_chunks)
+
+            # Convert float32 → int16 → bytes and append to rolling buffer
+            for chunk in new_chunks:
+                pcm = (chunk.flatten() * 32767).astype(np.int16).tobytes()
+                buffer += pcm
+
+            # Process as many complete frames as possible
+            while len(buffer) >= frame_bytes:
+                frame  = buffer[:frame_bytes]
+                buffer = buffer[frame_bytes:]
+
+                try:
+                    is_speech = vad.is_speech(frame, self.sample_rate)
+                except Exception:
+                    continue
+
+                if is_speech:
+                    speech_detected = True
+                    silence_start   = None
+                elif speech_detected:
+                    if silence_start is None:
+                        silence_start = time.time()
+                    elif time.time() - silence_start >= config.VAD_SILENCE_SECONDS:
+                        print(f"🔇 Silence detected — auto-stopping")
+                        self.stop_recording_and_transcribe()
+                        return
+
+            time.sleep(0.02)  # Check every 20ms — keeps up with frame rate
 
     # ── Level meter ────────────────────────────────────────────────────────────
 
@@ -174,6 +271,7 @@ class VoiceHandler:
         if self._level_timer:
             self._level_timer.cancel()
             self._level_timer = None
+        # _vad_thread is daemon — it will exit on its own once _is_recording=False
 
         with self._lock:
             if not self._is_recording:

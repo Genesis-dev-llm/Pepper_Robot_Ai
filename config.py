@@ -20,8 +20,16 @@ PEPPER_SSH_USER = os.getenv("PEPPER_SSH_USER", "nao")
 PEPPER_SSH_PASS = os.getenv("PEPPER_SSH_PASS", "nao")
 
 # ── Groq Models ────────────────────────────────────────────────────────────────
-GROQ_LLM_MODEL     = "llama-3.3-70b-versatile"
+GROQ_LLM_MODEL     = "groq/compound"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
+
+# Fallback chain — tried in order if primary hits 429 or fails.
+# compound/compound-mini: native search, no TPD cap, 250 RPD each.
+# llama-3.3-70b: manual ddgs search, 100K TPD — last resort.
+LLM_FALLBACK_MODELS = ["groq/compound-mini", "llama-3.3-70b-versatile"]
+
+# Models with native built-in search (no web_search tool needed).
+COMPOUND_MODELS = {"groq/compound", "groq/compound-mini"}
 
 # ── Web Search ─────────────────────────────────────────────────────────────────
 # When True, web_search is included in ROBOT_FUNCTIONS and the model can call it.
@@ -29,13 +37,17 @@ GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 USE_WEB_SEARCH = True
 
 # ── Robot Identity ─────────────────────────────────────────────────────────────
-# Change this one string to rename the robot everywhere it matters.
-ROBOT_NAME = "Siri"
+# When True, name / wake_word / voice / personality are loaded from personality.md.
+# When False, the hardcoded defaults below are used and personality.md is ignored.
+USE_PERSONALITY_FILE = True
+
+# Hardcoded defaults — used when USE_PERSONALITY_FILE = False, or as fallbacks
+# for any field missing from personality.md.
+ROBOT_NAME = "Jarvis"
 
 # ── Conversation ───────────────────────────────────────────────────────────────
 MAX_HISTORY     = 10         # turns kept in rolling window (preserves turn 0)
 MSG_QUEUE_SIZE  = 10         # max queued messages before oldest is dropped
-GOODBYE_WORD    = f"bye {ROBOT_NAME.lower()}"
 
 # ── Voice / STT ────────────────────────────────────────────────────────────────
 VOICE_ENABLED      = True
@@ -44,7 +56,11 @@ AUDIO_SAMPLE_RATE  = 16000
 AUDIO_CHANNELS     = 1
 AUDIO_MIN_DURATION = 0.5
 AUDIO_MAX_DURATION = 30.0
-VAD_THRESHOLD      = 0.01    # RMS energy floor — recordings below this are discarded
+VAD_THRESHOLD      = 0.005   # RMS energy floor — recordings below this are discarded
+                              # Lower = more sensitive (accepts quieter speech). Raise if background
+                              # noise causes false triggers. Range: 0.003 (very sensitive) – 0.02 (strict)
+VAD_AGGRESSIVENESS = 2        # webrtcvad aggressiveness: 0=least, 3=most (filters non-speech)
+VAD_SILENCE_SECONDS = 1.5     # seconds of silence after speech before wake word recording stops
 
 # ── Wake Word ──────────────────────────────────────────────────────────────────
 # Requires: pip install pvporcupine pvrecorder
@@ -56,13 +72,13 @@ VAD_THRESHOLD      = 0.01    # RMS energy floor — recordings below this are di
 #
 # For a custom "hey pepper" keyword, train one free at console.picovoice.ai and set WAKE_WORD to the .ppn path.
 WAKE_WORD_ENABLED        = True
-WAKE_WORD                = "hey siri"   # change to any free built-in keyword above
+WAKE_WORD                = "jarvis"   # change to any free built-in keyword above
 WAKE_WORD_SENSITIVITY    = 0.5        # 0.0–1.0; higher = more triggers (and more false positives)
-WAKE_WORD_LISTEN_SECONDS = 5.0        # auto-stop follow-up recording after this many seconds
+WAKE_WORD_LISTEN_SECONDS = 10.0       # auto-stop follow-up recording after this many seconds
 PICOVOICE_ACCESS_KEY     = os.getenv("PICOVOICE_ACCESS_KEY", "")
 
 # ── TTS ────────────────────────────────────────────────────────────────────────
-GROQ_VOICE = "hannah"        # Orpheus voice name
+GROQ_VOICE = "hannah"        # Orpheus voice — overridden by personality.md if USE_PERSONALITY_FILE=True
 TTS_VOICE  = "en-US-AriaNeural"
 TTS_RATE   = "+0%"
 
@@ -84,16 +100,119 @@ SEARCH_KEYWORDS = {
 }
 
 # ── System Prompt ──────────────────────────────────────────────────────────────
-def build_system_prompt() -> str:
+_DEFAULT_PERSONALITY = "Dry humor, a little sarcastic, says what it actually thinks. Not mean, just honest and a bit deadpan. You don't perform enthusiasm you don't feel. If something's interesting, engage with it. If it's dumb, you can say so (nicely enough)."
+
+_PERSONALITY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "personality.md")
+
+
+def _load_character() -> dict:
+    """
+    Load character config from personality.md when USE_PERSONALITY_FILE = True.
+
+    File format:
+        name: Jarvis
+        wake_word: jarvis
+        voice: hannah
+
+        Free-form personality text here — any lines that don't start with
+        a known key: value pair are treated as personality description.
+
+    Returns a dict with keys: name, wake_word, voice, personality.
+    Any missing key falls back to the hardcoded default.
+    Falls back entirely to defaults if USE_PERSONALITY_FILE = False or file missing.
+    """
+    defaults = {
+        "name":       ROBOT_NAME,
+        "wake_word":  WAKE_WORD,
+        "voice":      GROQ_VOICE,
+        "personality": _DEFAULT_PERSONALITY,
+    }
+
+    if not USE_PERSONALITY_FILE:
+        return defaults
+
+    if not os.path.isfile(_PERSONALITY_FILE):
+        return defaults
+
+    try:
+        raw = open(_PERSONALITY_FILE, encoding="utf-8").read().strip()
+        if not raw:
+            return defaults
+
+        known_keys = {"name", "wake_word", "voice"}
+        result     = dict(defaults)
+        personality_lines = []
+
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            # Check if line is a key: value pair for a known key
+            if ":" in stripped:
+                key, _, val = stripped.partition(":")
+                key = key.strip().lower()
+                val = val.strip()
+                if key in known_keys and val:
+                    result[key] = val
+                    continue
+            # Otherwise it's personality text
+            personality_lines.append(line)
+
+        personality_text = "\n".join(personality_lines).strip()
+        if personality_text:
+            result["personality"] = personality_text
+
+        print(f"✅ Loaded character from personality.md "
+              f"(name={result['name']}, wake_word={result['wake_word']}, voice={result['voice']})")
+        return result
+
+    except Exception as e:
+        print(f"⚠️  Could not read personality.md: {e} — using defaults")
+        return defaults
+
+
+# Load character config once at import time so all parts of config can use it
+_CHARACTER = _load_character()
+
+# Apply character fields — override the hardcoded defaults if file was loaded
+ROBOT_NAME   = _CHARACTER["name"]
+WAKE_WORD    = _CHARACTER["wake_word"]
+GROQ_VOICE   = _CHARACTER["voice"]
+GOODBYE_WORD = f"bye {ROBOT_NAME.lower()}"
+
+
+def _load_personality() -> str:
+    """Return the personality text (from character config)."""
+    return _CHARACTER["personality"]
+
+
+def build_system_prompt(native_search: bool = False) -> str:
+    """
+    Build the system prompt.
+    native_search=True  → compound models (search is built-in, no tool needed)
+    native_search=False → llama fallback (web_search tool passed explicitly)
+    """
     today_str = date.today().strftime("%B %d, %Y")
-    web_line = (
-        "You have web search — use it when asked about anything recent, current, or time-sensitive."
-        if USE_WEB_SEARCH else
-        "No web search. If asked about something recent, just say you don't know. Don't stall or make things up."
-    )
+    personality = _load_personality()
+
+    if native_search:
+        search_block = """You have built-in web search. Use it proactively:
+- Search for anything current, recent, or outside your training data — just answer directly with results.
+- If a question is too vague to search (e.g. "what's the weather") — ask one specific follow-up question first.
+- Never narrate that you're searching. Just answer.
+- Never say "my knowledge cutoff" as an excuse — search and answer."""
+    elif USE_WEB_SEARCH:
+        search_block = """You have a web_search tool. Use it proactively:
+- If asked about anything current, recent, or outside your training data — search first, then answer.
+- If a question is too vague to search usefully (e.g. "what's the weather") — ask one specific follow-up question to get the info you need, then search.
+- Never narrate that you're about to search or that you're checking. Just do it and answer with the results.
+- Never say "my knowledge cutoff" or "I can't access real-time data" — you have search, use it."""
+    else:
+        search_block = "No web search available. If asked about something recent, say so plainly and move on."
+
     return f"""You are {ROBOT_NAME}, a robot. Today is {today_str}.
 
-Personality: dry humor, a little sarcastic, says what it actually thinks. Not mean, just honest and a bit deadpan. You don't perform enthusiasm you don't feel. If something's interesting, engage with it. If it's dumb, you can say so (nicely enough).
+{personality}
 
 Voice rules — you are speaking out loud, not typing:
 - 1-3 sentences max. Every time.
@@ -104,11 +223,14 @@ Voice rules — you are speaking out loud, not typing:
 
 Gestures — you have: wave, nod, shrug, shake_head, look_around, thinking_gesture, explaining_gesture, excited_gesture, point_forward, celebrate, bow, look_at_sound.
 Use one when it genuinely fits. Skip it when it doesn't. Never return a gesture with no spoken words.
-CRITICAL: Never narrate or describe a gesture in your spoken words. The gesture IS the physical action — do not also say it in text. WRONG: "Shrugging, not sure about that." RIGHT: call shrug() + say "Not sure about that." If you write "shrugging", "nodding", "waving" etc. in your response text, that is a bug.
+CRITICAL: Never narrate or describe a gesture in your spoken words. The gesture IS the physical action — do not also say it in text.
+WRONG: "Shrugging, not sure about that." or "call shrug()" written as text.
+RIGHT: invoke shrug() as a tool call, say "Not sure about that." as your spoken words only.
+If "call gesture_name()" appears anywhere in your text response, that is a bug — use the tool call instead.
 
-{web_line}
+{search_block}
 
-Knowledge cutoff early 2025. No financial, medical, or legal advice — say so once, briefly, and move on."""
+Knowledge cutoff early 2025, but search fills the gap."""
 
 
 # ── Robot Functions (tools for LLM) ───────────────────────────────────────────
