@@ -20,16 +20,21 @@ PEPPER_SSH_USER = os.getenv("PEPPER_SSH_USER", "nao")
 PEPPER_SSH_PASS = os.getenv("PEPPER_SSH_PASS", "nao")
 
 # ── Groq Models ────────────────────────────────────────────────────────────────
-GROQ_LLM_MODEL     = "groq/compound"
+GROQ_LLM_MODEL     = "compound-beta"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
 # Fallback chain — tried in order if primary hits 429 or fails.
-# compound/compound-mini: native search, no TPD cap, 250 RPD each.
+# compound-beta / compound-beta-mini: native search, no TPD cap, 250 RPD each.
 # llama-3.3-70b: manual ddgs search, 100K TPD — last resort.
-LLM_FALLBACK_MODELS = ["groq/compound-mini", "llama-3.3-70b-versatile"]
+#
+# NOTE: the "groq/" prefix is a LiteLLM routing convention and must NOT be
+# used here — this project calls the Groq SDK directly.  The correct API
+# model strings are "compound-beta" and "compound-beta-mini".
+LLM_FALLBACK_MODELS = ["compound-beta-mini", "llama-3.3-70b-versatile"]
 
 # Models with native built-in search (no web_search tool needed).
-COMPOUND_MODELS = {"groq/compound", "groq/compound-mini"}
+# Must stay in sync with GROQ_LLM_MODEL and LLM_FALLBACK_MODELS above.
+COMPOUND_MODELS = {"compound-beta", "compound-beta-mini"}
 
 # ── Web Search ─────────────────────────────────────────────────────────────────
 # When True, web_search is included in ROBOT_FUNCTIONS and the model can call it.

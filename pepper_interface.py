@@ -26,11 +26,30 @@ Latest changes:
   Android home screen / Chrome.
 - show_tablet_webview now also calls enableTabletAccess() so all webview
   calls are interactive by default.
+
+connect() rework:
+- All service lookups, hardware init calls (Autonomous Life, BasicAwareness,
+  Body stiffness, wakeUp) moved inside the _attempt daemon thread so the
+  t.join(timeout) covers everything. If Pepper is unreachable or any NAOqi
+  call hangs, the whole connect() returns cleanly in ≤ timeout seconds
+  instead of blocking the main thread indefinitely. timeout raised to 15s
+  to comfortably cover wakeUp() on a slow robot.
+
+play_audio_file fix:
+- player.play(file_id) is a blocking NAOqi call that only returns when
+  playback finishes. A NAOqi stall or WiFi drop mid-play meant _speech_lock
+  was held forever. Now runs in a daemon thread with a 60s threading.Event
+  timeout so the lock is always released.
+
+camera stream fix:
+- Replaced time.sleep(2.0) with a TCP socket poll loop (10 × 0.5s) so we
+  break as soon as the server is ready instead of always waiting 2 full seconds.
 """
 
 import logging
 import os
 import random
+import socket
 import threading
 import time
 from contextlib import contextmanager
@@ -63,6 +82,10 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class PepperRobot:
+    # Minimum seconds between autonomous background gestures during HQ speech.
+    # Class-level constant — never varies per instance.
+    _GESTURE_COOLDOWN: float = 2.5
+
     def __init__(self, ip: str, port: int,
                  ssh_user: str = "nao", ssh_password: str = "nao"):
         self.ip           = ip
@@ -89,89 +112,96 @@ class PepperRobot:
 
         self._ssh_client: Optional["paramiko.SSHClient"] = None
         self._last_gesture_time: float = 0.0
-        self._GESTURE_COOLDOWN:  float = 2.5
 
     # ── Connection ─────────────────────────────────────────────────────────────
 
-    def connect(self, timeout: float = 5.0) -> bool:
+    def connect(self, timeout: float = 15.0) -> bool:
+        """
+        Connect to Pepper and initialise all NAOqi services.
+
+        Everything — TCP session, service lookups, hardware init, wakeUp() —
+        runs inside a daemon thread so t.join(timeout) is the single ceiling
+        for the entire connect sequence.  If Pepper is unreachable or any
+        call hangs, this method returns False cleanly within `timeout` seconds.
+        timeout default is 15s to comfortably cover wakeUp() on a slow robot.
+        """
         if not _QI_AVAILABLE:
             print("⚠️  qi not available — offline mode")
             self.connected = False
             return False
 
         print(f"🤖 Connecting to Pepper at {self.ip}:{self.port}…")
-        result = {"ok": False, "session": None, "error": None}
+        # [success, error_reason]
+        result = [False, "timed out"]
 
         def _attempt():
             try:
                 s = qi.Session()
                 s.connect(f"tcp://{self.ip}:{self.port}")
-                result["session"] = s
-                result["ok"] = True
+                self.session = s
+
+                self.tts             = self.session.service("ALTextToSpeech")
+                self.motion          = self.session.service("ALMotion")
+                self.animated_speech = self.session.service("ALAnimatedSpeech")
+                self.audio           = self.session.service("ALAudioDevice")
+                self.leds            = self.session.service("ALLeds")
+                self.awareness       = self.session.service("ALBasicAwareness")
+
+                try:
+                    self.tablet = self.session.service("ALTabletService")
+                    print("   ✅ Tablet service available")
+                except Exception:
+                    self.tablet = None
+                    print("   ⚠️  ALTabletService not available")
+
+                for label, fn in [
+                    ("Autonomous Life", lambda: self.session.service("ALAutonomousLife").setState("disabled")),
+                    ("BasicAwareness",  lambda: self.awareness.stopAwareness()),
+                    ("Body stiffness",  lambda: self.motion.setStiffnesses("Body", 1.0)),
+                ]:
+                    try:
+                        fn()
+                        print(f"   ✅ {label} OK")
+                    except Exception as e:
+                        print(f"   ⚠️  {label}: {e}")
+
+                try:
+                    self.motion.setExternalCollisionProtectionEnabled("Move", False)
+                except Exception:
+                    try:
+                        self.motion.setOrthogonalSecurityDistance(0.05)
+                        self.motion.setTangentialSecurityDistance(0.05)
+                    except Exception:
+                        pass
+
+                try:
+                    self.audio.setOutputVolume(100)
+                except Exception:
+                    pass
+
+                self.motion.wakeUp()
+
+                result[0] = True
+                result[1] = None
             except Exception as e:
-                result["error"] = e
+                result[0] = False
+                result[1] = str(e)
 
         t = threading.Thread(target=_attempt, daemon=True)
         t.start()
         t.join(timeout=timeout)
 
-        if not result["ok"]:
-            reason = "timed out" if t.is_alive() else str(result["error"])
+        if not result[0]:
+            reason = result[1]
             logging.warning("Connection failed (%s) — offline mode", reason)
             print("   Chat, TTS and web search will still work.")
             self.connected = False
             return False
 
-        self.session = result["session"]
-        try:
-            self.tts             = self.session.service("ALTextToSpeech")
-            self.motion          = self.session.service("ALMotion")
-            self.animated_speech = self.session.service("ALAnimatedSpeech")
-            self.audio           = self.session.service("ALAudioDevice")
-            self.leds            = self.session.service("ALLeds")
-            self.awareness       = self.session.service("ALBasicAwareness")
-
-            try:
-                self.tablet = self.session.service("ALTabletService")
-                print("   ✅ Tablet service available")
-            except Exception:
-                self.tablet = None
-                print("   ⚠️  ALTabletService not available")
-
-            for label, fn in [
-                ("Autonomous Life", lambda: self.session.service("ALAutonomousLife").setState("disabled")),
-                ("BasicAwareness",  lambda: self.awareness.stopAwareness()),
-                ("Body stiffness",  lambda: self.motion.setStiffnesses("Body", 1.0)),
-            ]:
-                try:
-                    fn()
-                    print(f"   ✅ {label} OK")
-                except Exception as e:
-                    print(f"   ⚠️  {label}: {e}")
-
-            try:
-                self.motion.setExternalCollisionProtectionEnabled("Move", False)
-            except Exception:
-                try:
-                    self.motion.setOrthogonalSecurityDistance(0.05)
-                    self.motion.setTangentialSecurityDistance(0.05)
-                except Exception:
-                    pass
-
-            try:
-                self.audio.setOutputVolume(100)
-            except Exception:
-                pass
-
-            self.motion.wakeUp()
-            time.sleep(1)
-            self.connected = True
-            print("✅ Connected to Pepper!")
-            return True
-        except Exception as e:
-            self.connected = False
-            logging.error("Service init failed: %s", e)
-            return False
+        time.sleep(1)
+        self.connected = True
+        print("✅ Connected to Pepper!")
+        return True
 
     def disconnect(self):
         try:
@@ -410,7 +440,25 @@ class PepperRobot:
             self._anim_thread = anim_thread
             anim_thread.start()
 
-            player.play(file_id)
+            # Run player.play() in a daemon thread so a hung NAOqi call
+            # cannot hold _speech_lock indefinitely.  A 60s timeout is far
+            # beyond any realistic TTS clip — if it fires we log and recover.
+            play_done = threading.Event()
+
+            def _play_worker():
+                try:
+                    player.play(file_id)
+                except Exception as _e:
+                    logging.warning("ALAudioPlayer.play error: %s", _e)
+                finally:
+                    play_done.set()
+
+            threading.Thread(target=_play_worker, daemon=True, name="AudioPlay").start()
+            timed_out = not play_done.wait(timeout=60.0)
+            if timed_out:
+                logging.warning(
+                    "play_audio_file: player.play() timed out after 60s — releasing lock"
+                )
             return True
 
         except Exception as e:
@@ -679,7 +727,7 @@ class PepperRobot:
 
     EMOTION_COLOUR_MAP = {
         "happy":     "yellow",
-        "sad":       "blue",
+        "sad":       "purple",
         "excited":   "green",
         "curious":   "cyan",
         "surprised": "white",
@@ -838,7 +886,23 @@ class PepperRobot:
             return False
 
         print("⏳ Waiting for camera server to start…")
-        time.sleep(2.0)
+        # Poll the HTTP server port instead of sleeping a fixed 2s.
+        # On a loaded Pepper CPU the server can take longer than 2s to bind;
+        # on a fast one we waste time waiting.  Try up to 10 times with 0.5s
+        # gaps (5s ceiling) — break as soon as a TCP connection succeeds.
+        _camera_host = "198.18.0.1"
+        _camera_port = 8080
+        _ready = False
+        for _attempt in range(10):
+            try:
+                s = socket.create_connection((_camera_host, _camera_port), timeout=0.5)
+                s.close()
+                _ready = True
+                break
+            except OSError:
+                time.sleep(0.5)
+        if not _ready:
+            print("⚠️  Camera server did not respond after 5s — attempting webview anyway")
 
         stream_url = "http://198.18.0.1:8080/stream.html"
         try:

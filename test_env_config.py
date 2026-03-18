@@ -7,7 +7,7 @@ import os
 import sys
 
 # Add project directory to path
-sys.path.insert(0, '/mnt/user-data/outputs/pepper_project')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 print("🔍 Testing Environment Variable Loading\n")
 print("="*60)

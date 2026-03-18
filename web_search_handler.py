@@ -5,6 +5,13 @@ Changes from original:
 - All searches run inside a ThreadPoolExecutor with a configurable timeout.
   DuckDuckGo calls can silently hang; this ensures the robot is never frozen
   waiting for a network response.
+
+Fix (timeout bypass):
+- Previously used `with ThreadPoolExecutor() as ex:` which calls
+  shutdown(wait=True) on exit — blocking until the hung thread finishes and
+  completely negating the timeout.  Now the executor is created manually and
+  shutdown(wait=False) is called in a finally block so a timed-out search
+  thread is abandoned immediately.
 """
 
 import concurrent.futures
@@ -33,10 +40,10 @@ class WebSearchHandler:
         the LLM context.  Never hangs — returns an error string on timeout.
         """
         print(f"🔍 Web search: '{query}'")
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                future = ex.submit(self._do_search, query)
-                results = future.result(timeout=self.timeout)
+            future  = executor.submit(self._do_search, query)
+            results = future.result(timeout=self.timeout)
         except concurrent.futures.TimeoutError:
             msg = f"Search timed out after {self.timeout}s for '{query}'"
             print(f"⏱️ {msg}")
@@ -45,6 +52,11 @@ class WebSearchHandler:
             msg = f"Search error: {e}"
             print(f"❌ {msg}")
             return msg
+        finally:
+            # wait=False abandons any still-running thread immediately.
+            # Using the executor as a context manager called shutdown(wait=True)
+            # which blocked until the hung thread finished — defeating the timeout.
+            executor.shutdown(wait=False)
 
         if not results:
             return f"No results found for '{query}'"
@@ -65,13 +77,15 @@ class WebSearchHandler:
 
     def search_structured(self, query: str) -> List[Dict]:
         """Return raw result dicts (for programmatic use)."""
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                future = ex.submit(self._do_search, query)
-                return future.result(timeout=self.timeout)
+            future = executor.submit(self._do_search, query)
+            return future.result(timeout=self.timeout)
         except Exception as e:
             print(f"❌ Structured search error: {e}")
             return []
+        finally:
+            executor.shutdown(wait=False)
 
     # ------------------------------------------------------------------
     # Internal

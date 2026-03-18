@@ -15,6 +15,12 @@ Fixes from previous version:
 - play_audio: fixed static noise when playing Edge TTS MP3 files.
   aplay only handles WAV/PCM — routing MP3 files to mpg123/ffplay/paplay
   instead. aplay is now only used for .wav files.
+
+Fix (_groq_daily_limit_hit false positive):
+- Previously the flag was set if "daily" appeared anywhere in the error
+  string — too broad.  An unrelated error message containing the word
+  "daily" would permanently disable Groq TTS for the session.
+  Now only set on "daily limit" or "daily quota" (exact Groq API phrasing).
 """
 
 import asyncio
@@ -258,7 +264,9 @@ class HybridTTSHandler:
             return True
         except Exception as e:
             err = str(e).lower()
-            if "429" in err or "rate limit" in err or "daily" in err:
+            if "429" in err or "rate limit" in err or "daily limit" in err or "daily quota" in err:
+                # Only set the permanent flag for genuine daily-limit exhaustion,
+                # not for any error that happens to contain the word "daily".
                 print("⏳ Groq TTS rate-limited → Tier 2")
                 self._groq_daily_limit_hit = True
             else:

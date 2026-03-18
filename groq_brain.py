@@ -12,6 +12,13 @@ Changes from previous version:
   that handles malformed tags where the model omits the closing '>' on the
   opening tag (e.g. <function=express_emotion{"emotion":"curious"}</function>).
 - chat_with_context retries without tools on Groq 400 (malformed tool call).
+
+Fix (history read outside lock):
+- conversation_history is a mutable list shared across threads.  Both chat()
+  and chat_with_context() previously read it without holding _history_lock,
+  meaning a concurrent _trim_history() or history append could produce a
+  stale or torn slice.  Both methods now snapshot the history under the lock
+  before building the messages list.
 """
 
 import json
@@ -236,9 +243,15 @@ class GroqBrain:
         is made without tools to get the spoken response.
         """
         try:
+            # Snapshot history under lock before building the messages list.
+            # Without the lock another thread could be mid-trim or mid-append,
+            # producing a stale or torn slice that silently corrupts context.
+            with self._history_lock:
+                history_snapshot = list(self.conversation_history)
+
             messages = (
                 [{"role": "system", "content": self.system_prompt}]
-                + _sanitize_history(self.conversation_history)
+                + _sanitize_history(history_snapshot)
                 + [{"role": "user", "content": user_message}]
             )
 
@@ -327,7 +340,8 @@ class GroqBrain:
                     print(f"❌ Chat retry failed: {e2}")
                     return None, None
             print(f"❌ Chat error: {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             return None, None
 
     def chat_with_context(
@@ -341,9 +355,15 @@ class GroqBrain:
         If Groq rejects with a 400 (malformed tool call in model output),
         retries once without tools to still get a spoken response.
         """
+        # Snapshot history under lock before building the messages list.
+        # Same reasoning as chat() — concurrent trim/append without the lock
+        # can produce a stale or torn slice sent to the API.
+        with self._history_lock:
+            history_snapshot = list(self.conversation_history)
+
         messages = (
             [{"role": "system", "content": self.system_prompt}]
-            + _sanitize_history(self.conversation_history)
+            + _sanitize_history(history_snapshot)
             + [{"role": "system", "content":
                 "[Search result — use this to answer; do NOT repeat verbatim]:\n" + context}]
             + [{"role": "user", "content": user_message}]
@@ -428,7 +448,8 @@ class GroqBrain:
                     return None, None
 
             print(f"❌ chat_with_context error: {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             return None, None
 
     def _get_verbal_response(
@@ -436,7 +457,14 @@ class GroqBrain:
         prior_messages: List[Dict],
         function_calls: List[Dict],
     ) -> str:
-        """Follow-up call when model returned only tool calls with no text."""
+        """
+        Follow-up call when model returned only tool calls with no text.
+
+        If the follow-up call also returns nothing (compound models occasionally
+        return a second tool-only response), fall back to a minimal spoken
+        acknowledgement so Pepper always says something rather than going
+        silently blank after performing a gesture.
+        """
         try:
             gesture_names = [f["name"] for f in function_calls if f["name"] != "web_search"]
             context = f"[You already chose to perform: {', '.join(gesture_names)}] " if gesture_names else ""
@@ -453,10 +481,15 @@ class GroqBrain:
             text = _clean_response_text(response.choices[0].message.content or "")
             if text:
                 print("🔄 Follow-up verbal response obtained")
-            return text
+                return text
+            # Model returned empty text again (e.g. compound returned another
+            # tool-only response).  Return a minimal fallback so TTS has
+            # something to say rather than silently dropping the turn.
+            print("⚠️  Follow-up verbal response empty — using fallback")
+            return "Sure."
         except Exception as e:
             print(f"⚠️  Follow-up verbal response failed: {e}")
-            return ""
+            return "Sure."
 
     # ── Search intent detection ────────────────────────────────────────────────
 
@@ -476,6 +509,8 @@ class GroqBrain:
         Keep at most MAX_HISTORY turns (pairs).
         Always preserve the first user/assistant exchange for intro context.
         When over limit, remove from the middle (turns 2 & 3), not from turn 0.
+
+        Must be called with _history_lock already held.
         """
         cap = config.MAX_HISTORY * 2
         hist = self.conversation_history

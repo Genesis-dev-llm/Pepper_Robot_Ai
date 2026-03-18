@@ -22,6 +22,12 @@ Latest changes:
        start_camera_callback is expected to be non-blocking (caller
        spawns its own thread). update_camera_status(bool) is thread-safe
        and updates the button label and status dot from any thread.
+
+Fix (_process_queues queue drain):
+- `kind, data = self.message_queue.get_nowait()` only caught queue.Empty.
+  A non-tuple item in the queue raises ValueError which propagated into the
+  DPG render loop and would crash the GUI.  Now catches ValueError and
+  TypeError as well so any malformed queue item is silently skipped.
 """
 
 import os
@@ -644,43 +650,47 @@ class PepperDearPyGUI:
         while not self.message_queue.empty():
             try:
                 kind, data = self.message_queue.get_nowait()
-                if kind == "pepper":
-                    self._add_pepper_message_internal(data)
-                elif kind == "system":
-                    self._add_system_message(data)
-                elif kind == "user_display":
-                    text, source = data
-                    self._add_user_message(text, voice=(source == "voice"))
-                elif kind == "recording_state":
-                    self._set_recording_internal(data)
-                elif kind == "robot_active":
-                    try:
-                        color = (80, 200, 80) if data else (200, 60, 60)
-                        dpg.configure_item("active_dot", color=color)
-                    except Exception:
-                        pass
-                elif kind == "connection_status":
-                    try:
-                        color = (0, 200, 200) if data else (120, 120, 120)
-                        dpg.configure_item("connection_dot", color=color)
-                    except Exception:
-                        pass
-                elif kind == "tts_tier":
-                    try:
-                        dpg.set_value("tts_tier_text", f"[{data}]")
-                    except Exception:
-                        pass
-                elif kind == "audio_level":
-                    try:
-                        dpg.set_value("audio_level_bar", float(data))
-                    except Exception:
-                        pass
-                elif kind == "camera_status":
-                    self._set_camera_status_internal(data)
-                elif kind == "file_selected":
-                    self._on_image_selected(None, {"file_path_name": data})
-            except queue.Empty:
+            except (queue.Empty, ValueError, TypeError):
+                # queue.Empty  — race between .empty() check and .get_nowait()
+                # ValueError   — item in queue is not a 2-tuple (shouldn't happen
+                #                but would previously crash the DPG render loop)
+                # TypeError    — item is not iterable at all
                 break
+            if kind == "pepper":
+                self._add_pepper_message_internal(data)
+            elif kind == "system":
+                self._add_system_message(data)
+            elif kind == "user_display":
+                text, source = data
+                self._add_user_message(text, voice=(source == "voice"))
+            elif kind == "recording_state":
+                self._set_recording_internal(data)
+            elif kind == "robot_active":
+                try:
+                    color = (80, 200, 80) if data else (200, 60, 60)
+                    dpg.configure_item("active_dot", color=color)
+                except Exception:
+                    pass
+            elif kind == "connection_status":
+                try:
+                    color = (0, 200, 200) if data else (120, 120, 120)
+                    dpg.configure_item("connection_dot", color=color)
+                except Exception:
+                    pass
+            elif kind == "tts_tier":
+                try:
+                    dpg.set_value("tts_tier_text", f"[{data}]")
+                except Exception:
+                    pass
+            elif kind == "audio_level":
+                try:
+                    dpg.set_value("audio_level_bar", float(data))
+                except Exception:
+                    pass
+            elif kind == "camera_status":
+                self._set_camera_status_internal(data)
+            elif kind == "file_selected":
+                self._on_image_selected(None, {"file_path_name": data})
 
         last_status = None
         while not self.status_queue.empty():

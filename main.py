@@ -23,7 +23,25 @@ from wake_word_handler import WakeWordHandler, _PORCUPINE_AVAILABLE
 from web_search_handler import WebSearchHandler
 from chat_logger import ChatLogger
 
-chat_log = ChatLogger()  # module-level so all functions can access it
+
+# ── Chat logger ────────────────────────────────────────────────────────────────
+# Constructed at module level so _process_message() and other functions can
+# reference it without needing to pass it around.  If the logs/ directory
+# cannot be created (disk full, permissions, read-only FS) we fall back to a
+# silent no-op stub so the rest of the program still starts normally.
+
+class _NullChatLogger:
+    """Silent no-op logger used when ChatLogger cannot be initialised."""
+    def log_user(self, *a, **kw):   pass
+    def log_pepper(self, *a, **kw): pass
+    def log_search(self, *a, **kw): pass
+    def log_system(self, *a, **kw): pass
+
+try:
+    chat_log = ChatLogger()
+except Exception as _chat_log_err:
+    print(f"⚠️  Chat logger unavailable ({_chat_log_err}) — logging disabled")
+    chat_log = _NullChatLogger()
 
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
@@ -416,31 +434,37 @@ def _say(
     emotion:          Optional[str]      = None,
     gesture_callback: Optional[Callable] = None,
 ):
-    try:
-        if _pepper_ok():
-            def _status_cb(msg: str):
-                if gui and gui.is_running:
-                    gui.update_status(msg)
-            pepper.speak_hq(
-                text,
-                tts,
-                emotion          = emotion,
-                status_callback  = _status_cb,
-                gesture_callback = gesture_callback,
-            )
-        else:
+    """
+    Speak text through Pepper (HQ pipeline) or the laptop TTS fallback.
+
+    Status is intentionally NOT reset to "Ready" here — _process_message()'s
+    own finally block is the single authoritative place that does that.
+    Resetting here as well caused a race: if a queued message was waiting,
+    _drain_queue() would set status to "Thinking…" immediately after
+    _process_message()'s finally, and an extra "Ready" write from _say()
+    could briefly overwrite it.
+    """
+    if _pepper_ok():
+        def _status_cb(msg: str):
             if gui and gui.is_running:
-                gui.update_status("🎙️ Generating voice…")
-            if tts:
-                if gesture_callback:
-                    try:
-                        gesture_callback()
-                    except Exception:
-                        pass
-                tts.speak_and_play(text, emotion=emotion)
-    finally:
+                gui.update_status(msg)
+        pepper.speak_hq(
+            text,
+            tts,
+            emotion          = emotion,
+            status_callback  = _status_cb,
+            gesture_callback = gesture_callback,
+        )
+    else:
         if gui and gui.is_running:
-            gui.update_status("Ready")
+            gui.update_status("🎙️ Generating voice…")
+        if tts:
+            if gesture_callback:
+                try:
+                    gesture_callback()
+                except Exception:
+                    pass
+            tts.speak_and_play(text, emotion=emotion)
 
 
 # ── Camera stream helpers ─────────────────────────────────────────────────────
